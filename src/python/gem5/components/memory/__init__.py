@@ -39,6 +39,7 @@ from .single_channel import (
     SingleChannelDDR3_2133,
     SingleChannelDDR4_2400,
     SingleChannelHBM,
+    SingleChannelHBM2,
     SingleChannelLPDDR3_1600,
 )
 

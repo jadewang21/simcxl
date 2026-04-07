@@ -40,7 +40,7 @@ from .dram_interfaces.ddr5 import (
     DDR5_6400_4x8,
     DDR5_8400_4x8,
 )
-from .dram_interfaces.hbm import HBM_1000_4H_1x128
+from .dram_interfaces.hbm import HBM_1000_4H_1x128, HBM_2000_4H_1x64
 from .dram_interfaces.lpddr3 import LPDDR3_1600_1x32
 from .memory import ChanneledMemory
 
@@ -93,6 +93,19 @@ def SingleChannelHBM(
     if not size:
         size = "256MiB"
     return ChanneledMemory(HBM_1000_4H_1x128, 1, 64, size=size)
+
+
+def SingleChannelHBM2(
+    size: Optional[str] = None,
+) -> AbstractMemorySystem:
+    """
+    A single HBM2 pseudo-channel (64-bit, 2Gbps DDR).
+    HBM2 timings: tCL=18ns, tRCD=12ns, tRP=14ns, tBURST=2ns.
+    Page-miss read latency ~46ns, close-adaptive page policy.
+    """
+    if not size:
+        size = "256MiB"
+    return ChanneledMemory(HBM_2000_4H_1x64, 1, 64, size=size)
 
 
 def DIMM_DDR5_4400(

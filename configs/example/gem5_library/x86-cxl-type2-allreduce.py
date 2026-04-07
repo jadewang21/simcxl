@@ -23,7 +23,7 @@ from gem5.components.boards.x86_board_cxl_type2 import X86BoardCXLType2
 from gem5.components.cachehierarchies.ruby.cxl_mesi_two_level_cache_hierarchy import (
     CXLMESITwoLevelCacheHierarchy,
 )
-from gem5.components.memory.single_channel import DIMM_DDR5_4400
+from gem5.components.memory.single_channel import DIMM_DDR5_4400, SingleChannelHBM2
 from gem5.components.processors.cpu_types import CPUTypes
 from gem5.components.processors.simple_switchable_processor import (
     SimpleSwitchableProcessor,
@@ -48,6 +48,8 @@ parser.add_argument("--hbm-per-npu", type=str, default="256MiB",
                     help="HBM size per NPU (used when num-npus > 1)")
 parser.add_argument("--prefetch-ownership", action="store_true", default=False,
                     help="Enable prefetch-for-ownership: overlap GETX with RS Compute (Mode 10)")
+parser.add_argument("--num-l2-banks", type=int, default=1,
+                    help="Number of L2 cache banks (default 1)")
 args = parser.parse_args()
 
 requires(
@@ -63,16 +65,16 @@ cache_hierarchy = CXLMESITwoLevelCacheHierarchy(
     l1i_assoc=8,
     l2_size="512KiB",
     l2_assoc=16,
-    num_l2_banks=1,
+    num_l2_banks=args.num_l2_banks,
 )
 
 memory = DIMM_DDR5_4400(size="3GiB")
 
 if args.num_npus > 1:
-    cxl_dram = [DIMM_DDR5_4400(size=args.hbm_per_npu)
+    cxl_dram = [SingleChannelHBM2(size=args.hbm_per_npu)
                 for _ in range(args.num_npus)]
 else:
-    cxl_dram = DIMM_DDR5_4400(size="8GB")
+    cxl_dram = SingleChannelHBM2(size="8GB")
 
 processor = SimpleSwitchableProcessor(
     starting_core_type=CPUTypes.KVM,
@@ -124,5 +126,6 @@ print(f"[AllReduce] mode={args.lsu_mode}, lsu_num={args.lsu_num}, "
       f"rounds={args.allreduce_rounds}, num_npus={args.num_npus}, "
       f"compute_lat={args.compute_lat}, "
       f"hbm_per_npu={args.hbm_per_npu if args.num_npus > 1 else '8GB'}, "
-      f"prefetch_ownership={args.prefetch_ownership}")
+      f"prefetch_ownership={args.prefetch_ownership}, "
+      f"num_l2_banks={args.num_l2_banks}, cxl_dram=HBM2")
 simulator.run()
