@@ -86,6 +86,7 @@ class X86BoardCXLType2(AbstractSystemBoard, KernelDiskWorkload):
         allreduce_rounds: int = 4,
         num_npus: int = 4,
         compute_lat_per_line: str = "40ns",
+        prefetch_ownership: bool = False,
     ) -> None:
         if isinstance(cxl_memory, list):
             self._cxl_memories = cxl_memory
@@ -98,6 +99,7 @@ class X86BoardCXLType2(AbstractSystemBoard, KernelDiskWorkload):
         self._allreduce_rounds = allreduce_rounds
         self._num_npus = num_npus
         self._compute_lat_per_line = compute_lat_per_line
+        self._prefetch_ownership = prefetch_ownership
 
         super().__init__(
             clk_freq=clk_freq,
@@ -170,7 +172,8 @@ class X86BoardCXLType2(AbstractSystemBoard, KernelDiskWorkload):
             npu.configCXL(Latency("15ns"), 48,
                     self._lsu_mode, self._lsu_num, self._load_store,
                     self._allreduce_rounds, self._num_npus,
-                    self._compute_lat_per_line, npu_id=i)
+                    self._compute_lat_per_line, npu_id=i,
+                    prefetch_ownership=self._prefetch_ownership)
 
         print("LSU mode:", self._lsu_mode, "LSU num:", self._lsu_num,
                 "LSU load_store:", self._load_store,
@@ -178,7 +181,8 @@ class X86BoardCXLType2(AbstractSystemBoard, KernelDiskWorkload):
                 "Num NPUs:", self._num_npus,
                 "Real NPU instances:", n_npus,
                 "HBM/NPU:", per_npu_size,
-                "Compute lat/line:", self._compute_lat_per_line)
+                "Compute lat/line:", self._compute_lat_per_line,
+                "Prefetch ownership:", self._prefetch_ownership)
 
         # Setup memory system specific settings.
         dma_exclude = [self.pc.south_bridge.ide.dma]

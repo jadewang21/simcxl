@@ -46,6 +46,8 @@ parser.add_argument("--compute-lat", type=str, default="40ns",
                     help="Compute latency per cache line for reduction (modes 9/10)")
 parser.add_argument("--hbm-per-npu", type=str, default="256MiB",
                     help="HBM size per NPU (used when num-npus > 1)")
+parser.add_argument("--prefetch-ownership", action="store_true", default=False,
+                    help="Enable prefetch-for-ownership: overlap GETX with RS Compute (Mode 10)")
 args = parser.parse_args()
 
 requires(
@@ -94,6 +96,7 @@ board = X86BoardCXLType2(
     allreduce_rounds=args.allreduce_rounds,
     num_npus=args.num_npus,
     compute_lat_per_line=args.compute_lat,
+    prefetch_ownership=args.prefetch_ownership,
 )
 
 command = (
@@ -120,5 +123,6 @@ simulator = Simulator(
 print(f"[AllReduce] mode={args.lsu_mode}, lsu_num={args.lsu_num}, "
       f"rounds={args.allreduce_rounds}, num_npus={args.num_npus}, "
       f"compute_lat={args.compute_lat}, "
-      f"hbm_per_npu={args.hbm_per_npu if args.num_npus > 1 else '8GB'}")
+      f"hbm_per_npu={args.hbm_per_npu if args.num_npus > 1 else '8GB'}, "
+      f"prefetch_ownership={args.prefetch_ownership}")
 simulator.run()

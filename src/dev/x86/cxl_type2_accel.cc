@@ -76,6 +76,16 @@ CXLType2Accel::CXLType2Accel(const Params &p)
     computeLatPerLine(p.compute_lat_per_line),
     ar_rs_compute_total(0),
     computeDoneEvent([this]{ arComputeDone(); }, name()),
+    prefetchOwnership(p.prefetch_ownership),
+    ar_prefetch_active(false),
+    ar_prefetch_done(false),
+    ar_waiting_for_prefetch(false),
+    pf_cur_num(0),
+    pf_recv_num(0),
+    pf_total(0),
+    pf_blocked_pkt(nullptr),
+    pf_start_tick(0),
+    pfNextEvent([this]{ issuePrefetchNext(); }, name()),
     barrierReleaseEvent([this]{ arDoTransition(); }, name()),
     accelStatus(Uninitialized),
     cxlRspPort(p.name + ".cxl_rsp_port", *this, memReqPort,
@@ -145,6 +155,8 @@ CXLType2Accel::CXLStats::CXLStats(CXLType2Accel &_ctrl)
                "Ring AllReduce compute-read phase latency"),
       ADD_STAT(arRsComputeLat, statistics::units::Tick::get(),
                "Ring AllReduce RS compute delay total"),
+      ADD_STAT(arPrefetchLat, statistics::units::Tick::get(),
+               "Ring AllReduce ownership prefetch latency"),
       ADD_STAT(dmcHits, statistics::units::Count::get(),
                "DMC (device memory cache) hit count"),
       ADD_STAT(dmcMisses, statistics::units::Count::get(),
@@ -227,6 +239,11 @@ CXLType2Accel::DcachePort::recvTimingResp(PacketPtr pkt)
 void
 CXLType2Accel::recvData(PacketPtr pkt)
 {
+    if (ar_prefetch_active) {
+        pfResponseReceived();
+        return;
+    }
+
     if (pkt->isRead()) {
         pkt->writeData(remote_data);
         DPRINTF(CXLType1Accel, "Received LOAD data for addr %#x, recv_num: %d\n", 
@@ -482,6 +499,75 @@ CXLType2Accel::arComputeDone()
 }
 
 void
+CXLType2Accel::startOwnershipPrefetch()
+{
+    ar_prefetch_active = true;
+    ar_prefetch_done = false;
+    pf_cur_num = 0;
+    pf_recv_num = 0;
+    pf_total = (ar_phase_type == 2) ? lsu_num : chunk_size;
+    pf_start_tick = curTick();
+    DPRINTF(CXLType1Accel,
+            "[NPU%d] starting ownership prefetch for %d lines "
+            "(phase_type=%d, subround=%d)\n",
+            npu_id, pf_total, ar_phase_type, ar_subround);
+    issuePrefetchNext();
+}
+
+void
+CXLType2Accel::issuePrefetchNext()
+{
+    if (pf_cur_num >= pf_total)
+        return;
+
+    bool saved_read = ar_is_read_phase;
+    ar_is_read_phase = false;
+    Addr addr = getPhyAddr(pf_cur_num);
+    ar_is_read_phase = saved_read;
+
+    RequestPtr req = std::make_shared<Request>(addr, cacheLineSize, 0, 0);
+    PacketPtr pkt = Packet::createRead(req);
+    pkt->dataDynamic<uint8_t>(new uint8_t[cacheLineSize]);
+
+    if (!dcachePort.sendTimingReq(pkt)) {
+        DPRINTF(CXLType1Accel,
+                "[NPU%d] prefetch blocked at idx %d, addr %#x\n",
+                npu_id, pf_cur_num, addr);
+        pf_blocked_pkt = pkt;
+    } else {
+        DPRINTF(CXLType1Accel,
+                "[NPU%d] prefetch sent idx %d, addr %#x\n",
+                npu_id, pf_cur_num, addr);
+        pf_cur_num++;
+        if (pf_cur_num < pf_total) {
+            if (!pfNextEvent.scheduled())
+                schedule(pfNextEvent, nextCycle());
+        }
+    }
+}
+
+void
+CXLType2Accel::pfResponseReceived()
+{
+    pf_recv_num++;
+    DPRINTF(CXLType1Accel,
+            "[NPU%d] prefetch response %d/%d\n",
+            npu_id, pf_recv_num, pf_total);
+    if (pf_recv_num >= pf_total) {
+        ar_prefetch_active = false;
+        ar_prefetch_done = true;
+        stats.arPrefetchLat = curTick() - pf_start_tick;
+        DPRINTF(CXLType1Accel,
+                "[NPU%d] all ownership prefetches done (%llu ticks)\n",
+                npu_id, curTick() - pf_start_tick);
+        if (ar_waiting_for_prefetch) {
+            ar_waiting_for_prefetch = false;
+            arStartPhase(false);
+        }
+    }
+}
+
+void
 CXLType2Accel::arBarrierReached()
 {
     s_barrier_count++;
@@ -515,8 +601,21 @@ CXLType2Accel::arDoTransition()
                     "[NPU%d] RS subround %d compute delay: %llu ticks\n",
                     npu_id, ar_subround, delay);
             schedule(computeDoneEvent, curTick() + delay);
+            if (prefetchOwnership && lsu_mode == 10) {
+                startOwnershipPrefetch();
+            }
         } else {
             ar_compute_done = false;
+            if (prefetchOwnership && lsu_mode == 10 &&
+                ar_phase_type == 0 && !ar_prefetch_done) {
+                ar_waiting_for_prefetch = true;
+                DPRINTF(CXLType1Accel,
+                        "[NPU%d] compute done, waiting for prefetch\n",
+                        npu_id);
+                return;
+            }
+            ar_prefetch_done = false;
+            ar_waiting_for_prefetch = false;
             arStartPhase(false);
         }
     } else {
@@ -590,6 +689,21 @@ CXLType2Accel::sendDataD2D(PacketPtr pkt, bool read)
 void
 CXLType2Accel::DcachePort::recvReqRetry()
 {
+    if (device->ar_prefetch_active && device->pf_blocked_pkt) {
+        PacketPtr tmp = device->pf_blocked_pkt;
+        if (sendTimingReq(tmp)) {
+            DPRINTF(CXLType1Accel,
+                    "[NPU%d] prefetch retry succeeded idx %d\n",
+                    device->npu_id, device->pf_cur_num);
+            device->pf_blocked_pkt = nullptr;
+            device->pf_cur_num++;
+            if (device->pf_cur_num < device->pf_total) {
+                if (!device->pfNextEvent.scheduled())
+                    device->schedule(device->pfNextEvent, device->nextCycle());
+            }
+        }
+        return;
+    }
     // we shouldn't get a retry unless we have a packet that we're
     // waiting to transmit
     assert(device->dcache_pkt != NULL);

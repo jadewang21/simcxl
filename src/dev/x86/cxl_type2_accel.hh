@@ -215,6 +215,21 @@ class CXLType2Accel : public PciDevice
         void arComputeDone();
         EventFunctionWrapper computeDoneEvent;
 
+        // Prefetch-for-ownership: overlap GETX prefetch with RS Compute
+        bool prefetchOwnership;
+        bool ar_prefetch_active;
+        bool ar_prefetch_done;
+        bool ar_waiting_for_prefetch;
+        int pf_cur_num;
+        int pf_recv_num;
+        int pf_total;
+        PacketPtr pf_blocked_pkt;
+        Tick pf_start_tick;
+        EventFunctionWrapper pfNextEvent;
+        void startOwnershipPrefetch();
+        void issuePrefetchNext();
+        void pfResponseReceived();
+
         // Multi-NPU coordination
         static const int MAX_NPUS = 16;
         static std::vector<CXLType2Accel*> s_all_npus;
@@ -497,6 +512,7 @@ class CXLType2Accel : public PciDevice
             statistics::Scalar arAgWriteLat;
             statistics::Scalar arComputeReadLat;
             statistics::Scalar arRsComputeLat;
+            statistics::Scalar arPrefetchLat;
             statistics::Scalar dmcHits;
             statistics::Scalar dmcMisses;
             statistics::Scalar reqQueFullEvents;

@@ -1,1 +1,0 @@
-m5 exit;echo 'Switched to Timing CPU';m5 resetstats;/home/test_code/LSU_test;m5 exit;

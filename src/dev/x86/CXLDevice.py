@@ -114,6 +114,7 @@ class CXLType2Accel(PciDevice):
     num_npus = Param.Int(4, "Number of NPUs in Ring AllReduce (modes 7-10)")
     npu_id = Param.Int(0, "NPU ID in the ring (0-based)")
     compute_lat_per_line = Param.Latency("40ns", "Compute latency per cache line for reduction (400MHz FPGA, 2x FP16 adder)")
+    prefetch_ownership = Param.Bool(False, "Enable prefetch-for-ownership: overlap GETX with RS Compute (Mode 10)")
 
     VendorID = 0x8086
     DeviceID = 0X7890
@@ -148,7 +149,7 @@ class CXLType2Accel(PciDevice):
 
     def configCXL(self, proc_lat, queue_size, lsu_mode, lsu_num, load_store,
                   allreduce_rounds=4, num_npus=4, compute_lat_per_line="40ns",
-                  npu_id=0):
+                  npu_id=0, prefetch_ownership=False):
         self.proto_proc_lat = proc_lat
         self.rsp_size = queue_size
         self.req_size = queue_size
@@ -159,3 +160,4 @@ class CXLType2Accel(PciDevice):
         self.num_npus = num_npus
         self.npu_id = npu_id
         self.compute_lat_per_line = compute_lat_per_line
+        self.prefetch_ownership = prefetch_ownership
