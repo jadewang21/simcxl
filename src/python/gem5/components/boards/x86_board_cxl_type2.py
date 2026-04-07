@@ -79,15 +79,25 @@ class X86BoardCXLType2(AbstractSystemBoard, KernelDiskWorkload):
         processor: AbstractProcessor,
         memory: AbstractMemorySystem,
         cache_hierarchy: AbstractCacheHierarchy,
-        cxl_memory: AbstractMemorySystem,
+        cxl_memory,  # single AbstractMemorySystem or list of them
         lsu_mode: int = 2,
         lsu_num: int = 32,
         load_store: int = 1,
+        allreduce_rounds: int = 4,
+        num_npus: int = 4,
+        compute_lat_per_line: str = "40ns",
     ) -> None:
-        self._cxl_memory_ptr = cxl_memory
+        if isinstance(cxl_memory, list):
+            self._cxl_memories = cxl_memory
+        else:
+            self._cxl_memories = [cxl_memory]
+        self._cxl_memory_ptr = self._cxl_memories[0]
         self._lsu_mode = lsu_mode
         self._lsu_num = lsu_num
         self._load_store = load_store
+        self._allreduce_rounds = allreduce_rounds
+        self._num_npus = num_npus
+        self._compute_lat_per_line = compute_lat_per_line
 
         super().__init__(
             clk_freq=clk_freq,
@@ -95,6 +105,9 @@ class X86BoardCXLType2(AbstractSystemBoard, KernelDiskWorkload):
             memory=memory,
             cache_hierarchy=cache_hierarchy,
         )
+        # All CXL memories must be children of the board for proxy resolution
+        for i, mem in enumerate(self._cxl_memories):
+            setattr(self, f'cxl_memory_{i}', mem)
         self.cxl_memory = self._cxl_memory_ptr
 
         if self.get_processor().get_isa() != ISA.X86:
@@ -106,8 +119,11 @@ class X86BoardCXLType2(AbstractSystemBoard, KernelDiskWorkload):
     @overrides(AbstractSystemBoard)
     def _setup_board(self) -> None:
         self.pc = Pc()
-        # cxl_device is dynamically initialized and attached
-        self.pc.south_bridge.cxl_device = CXLType2Accel(pci_func=0, pci_dev=6, pci_bus=0)
+
+        n_npus = len(self._cxl_memories)
+        for i in range(n_npus):
+            npu = CXLType2Accel(pci_func=0, pci_dev=6+i, pci_bus=0)
+            setattr(self.pc.south_bridge, f'cxl_dev{i}', npu)
 
         self.workload = X86FsLinux()
 
@@ -134,24 +150,42 @@ class X86BoardCXLType2(AbstractSystemBoard, KernelDiskWorkload):
         interrupts_address_space_base = 0xA000000000000000
         APIC_range_size = 1 << 12
 
-        # Configure CXL Device
-        cxl_dram = self._cxl_memory_ptr
-        cxl_mem_range = AddrRange(Addr(0x100000000), size=cxl_dram.get_size())
-        cxl_dram.set_memory_range([cxl_mem_range])
-        cxl_type2_accel = self.pc.south_bridge.cxl_device
-        cxl_type2_accel.connectMemory(cxl_mem_range, cxl_dram)
-        cxl_abstract_mems = []
-        for mc in cxl_dram.get_memory_controllers():
-            cxl_abstract_mems.append(mc.dram)
-        self.memories.extend(cxl_abstract_mems)
-        cxl_type2_accel.configCXL(Latency("15ns"), 48, 
-                self._lsu_mode, self._lsu_num, self._load_store)
-        print("LSU mode:", self._lsu_mode, "LSU num:", self._lsu_num, 
-                "LSU load_store:", self._load_store)
+        # Configure CXL Device(s) — one per NPU
+        CXL_BASE = 0x100000000
+        n_npus = len(self._cxl_memories)
+        npus = [getattr(self.pc.south_bridge, f'cxl_dev{i}')
+                for i in range(n_npus)]
+        per_npu_size = self._cxl_memories[0].get_size()
+        self._total_cxl_size = n_npus * per_npu_size
+
+        for i in range(n_npus):
+            cxl_dram = self._cxl_memories[i]
+            base_addr = CXL_BASE + i * per_npu_size
+            cxl_mem_range = AddrRange(Addr(base_addr), size=per_npu_size)
+            cxl_dram.set_memory_range([cxl_mem_range])
+            npu = npus[i]
+            npu.connectMemory(cxl_mem_range, cxl_dram)
+            for mc in cxl_dram.get_memory_controllers():
+                self.memories.append(mc.dram)
+            npu.configCXL(Latency("15ns"), 48,
+                    self._lsu_mode, self._lsu_num, self._load_store,
+                    self._allreduce_rounds, self._num_npus,
+                    self._compute_lat_per_line, npu_id=i)
+
+        print("LSU mode:", self._lsu_mode, "LSU num:", self._lsu_num,
+                "LSU load_store:", self._load_store,
+                "AllReduce rounds:", self._allreduce_rounds,
+                "Num NPUs:", self._num_npus,
+                "Real NPU instances:", n_npus,
+                "HBM/NPU:", per_npu_size,
+                "Compute lat/line:", self._compute_lat_per_line)
 
         # Setup memory system specific settings.
+        dma_exclude = [self.pc.south_bridge.ide.dma]
+        for npu in npus:
+            dma_exclude.append(npu.dma)
         if self.get_cache_hierarchy().is_ruby():
-            self.pc.attachIO(self.get_io_bus(), [self.pc.south_bridge.ide.dma, cxl_type2_accel.dma])
+            self.pc.attachIO(self.get_io_bus(), dma_exclude)
         else:
             self.bridge = Bridge(delay="50ns")
             self.bridge.mem_side_port = self.get_io_bus().cpu_side_ports
@@ -283,7 +317,7 @@ class X86BoardCXLType2(AbstractSystemBoard, KernelDiskWorkload):
         )
 
         entries.append(
-            X86E820Entry(addr=0x100000000, size=f"{cxl_mem_range.size()}B", range_type=20)
+            X86E820Entry(addr=0x100000000, size=f"{self._total_cxl_size}B", range_type=20)
         )
 
         self.workload.e820_table.entries = entries
@@ -302,8 +336,10 @@ class X86BoardCXLType2(AbstractSystemBoard, KernelDiskWorkload):
 
     @overrides(AbstractSystemBoard)
     def get_dma_ports(self) -> Sequence[Port]:
-        return [self.pc.south_bridge.ide.dma, self.iobus.mem_side_ports,
-                self.pc.south_bridge.cxl_device.dma]
+        ports = [self.pc.south_bridge.ide.dma, self.iobus.mem_side_ports]
+        for i in range(len(self._cxl_memories)):
+            ports.append(getattr(self.pc.south_bridge, f'cxl_dev{i}').dma)
+        return ports
 
     @overrides(AbstractSystemBoard)
     def has_coherent_io(self) -> bool:

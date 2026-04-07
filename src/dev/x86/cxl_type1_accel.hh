@@ -144,6 +144,12 @@ class CXLType1Accel : public PciDevice
         int stage;
         uint8_t* remote_data;
 
+        int write_recv_num;
+        int read_recv_num;
+        Tick first_read_issue_tick;
+        Tick write_done_tick;
+        Tick last_read_recv_tick;
+
         item paddr;
         Addr cur_paddr;
 
@@ -184,6 +190,8 @@ class CXLType1Accel : public PciDevice
             CXLStats(CXLType1Accel &_device);
     
             statistics::Scalar totalLoadLatency;
+            statistics::Scalar writePhaseLatency;
+            statistics::Scalar readPhaseLatency;
         };
     
         CXLStats stats;

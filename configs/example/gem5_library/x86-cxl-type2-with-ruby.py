@@ -134,8 +134,8 @@ command = (
 )
 
 board.set_kernel_disk_workload(
-    kernel=KernelResource(local_path='/home/xxx/code/fs_image/vmlinux'),
-    disk_image=DiskImageResource(local_path='/home/xxx/code/fs_image/parsec.img'),
+    kernel=KernelResource(local_path='/home/wang/llm/SimCXL-img/vmlinux'),
+    disk_image=DiskImageResource(local_path='/home/wang/llm/SimCXL-img/parsec.img'),
     readfile_contents=command,
 )
 

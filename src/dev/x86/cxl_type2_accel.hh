@@ -61,9 +61,6 @@ class CXLType2Accel : public PciDevice
                 Addr cacheBlockMask;
             protected:
 
-            /** Snoop a coherence request, we need to check if this causes
-            * a wakeup event on a device that is monitoring an address
-            */
             virtual void recvTimingSnoopReq(PacketPtr pkt);
 
             virtual bool recvTimingResp(PacketPtr pkt);
@@ -149,10 +146,85 @@ class CXLType2Accel : public PciDevice
         item paddr;
         Addr cur_paddr;
 
+        // D2D direct path: DevMemPort bypasses Ruby + CXL Controller
+        // to access device memory (HBM) directly, per MICRO'24 architecture.
+        class DevMemPort : public RequestPort {
+            public:
+                DevMemPort(CXLType2Accel *_device)
+                    : RequestPort(_device->name() + ".dev_mem_port", _device),
+                      device(_device) {}
+            protected:
+                CXLType2Accel* device;
+                bool recvTimingResp(PacketPtr pkt) override;
+                void recvReqRetry() override;
+        };
+
+        // DMC (Device Memory Cache) — per MICRO'24 Section IV:
+        // "A DCOH slice comprises device cache divided into HMC and DMC.
+        //  DMC stores data from device memory." 32KB, direct-mapped.
+        struct DMCEntry {
+            bool valid;
+            Addr tag;
+            DMCEntry() : valid(false), tag(0) {}
+        };
+        static const int MAX_DMC_SETS = 512; // 32KB / 64B
+
         DcachePort dcachePort;
         IcachePort icachePort;
+        DevMemPort devMemPort;
         PacketPtr dcache_pkt;
+        PacketPtr devmem_pkt;
         const unsigned int cacheLineSize;
+
+        // DMC state
+        DMCEntry dmc[MAX_DMC_SETS];
+        int dmc_sets;
+        Cycles dmcHitLatency;
+        AddrRange cxlMemRange;
+
+        bool isDeviceAddr(Addr addr) const;
+        void sendDataD2D(PacketPtr pkt, bool read);
+        void d2dResponseComplete();
+
+        // AllReduce state machine (modes 5/6/7/8)
+        static const int MAX_AR_ROUNDS = 64;
+        int allreduce_rounds;
+        int ar_round;
+        bool ar_is_read_phase;
+        Tick ar_phase_start;
+        Tick ar_total_start;
+        Addr dev_mem_base;
+        Tick ar_read_lat[MAX_AR_ROUNDS];
+        Tick ar_write_lat[MAX_AR_ROUNDS];
+
+        // Realistic Ring AllReduce (modes 7/8/9/10)
+        int num_npus;
+        int npu_id;
+        int ar_phase_type;   // 0=ReduceScatter, 1=AllGather, 2=ComputeRead
+        int ar_subround;     // round within current phase type
+        bool ar_compute_done; // true after RS compute delay finishes (prevents re-entry)
+        int chunk_size;      // lsu_num / num_npus
+        Tick ar_rs_read_total;
+        Tick ar_rs_write_total;
+        Tick ar_ag_read_total;
+        Tick ar_ag_write_total;
+
+        // Compute delay for reduction (modes 9/10)
+        Tick computeLatPerLine;  // ticks per cache line for reduction compute
+        Tick ar_rs_compute_total;
+        void arComputeDone();
+        EventFunctionWrapper computeDoneEvent;
+
+        // Multi-NPU coordination
+        static const int MAX_NPUS = 16;
+        static std::vector<CXLType2Accel*> s_all_npus;
+        static int s_barrier_count;
+        static int s_finished_count;
+        Addr dev_mem_bases[MAX_NPUS];
+        bool multiNpuMode() const { return s_all_npus.size() > 1; }
+        void arBarrierReached();
+        void arDoTransition();
+        EventFunctionWrapper barrierReleaseEvent;
 
     protected:
         enum Status
@@ -416,6 +488,17 @@ class CXLType2Accel : public PciDevice
             CXLStats(CXLType2Accel &_ctrl);
     
             statistics::Scalar totalLoadLatency;
+            statistics::Scalar arRound0ReadLat;
+            statistics::Scalar arSteadyReadLat;
+            statistics::Scalar arTotalWriteLat;
+            statistics::Scalar arRsReadLat;
+            statistics::Scalar arRsWriteLat;
+            statistics::Scalar arAgReadLat;
+            statistics::Scalar arAgWriteLat;
+            statistics::Scalar arComputeReadLat;
+            statistics::Scalar arRsComputeLat;
+            statistics::Scalar dmcHits;
+            statistics::Scalar dmcMisses;
             statistics::Scalar reqQueFullEvents;
             statistics::Scalar reqRetryCounts;
             statistics::Scalar rspQueFullEvents;
@@ -465,6 +548,8 @@ class CXLType2Accel : public PciDevice
         MemberEventWrapper<&CXLType2Accel::stage2> runStage2;
         void recvData(PacketPtr pkt);
         void LSUFinish();
+        void arPhaseComplete();
+        void arStartPhase(bool is_read);
 };
 
 } // namespace gem5

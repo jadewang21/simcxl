@@ -103,12 +103,21 @@ class SouthBridge(SimObject):
         self.ide.pio = bus.mem_side_ports
         if dma_ports.count(self.ide.dma) == 0:
             self.ide.dma = bus.cpu_side_ports
-        # cxl_device is dynamically initialized and attached in x86_board.py
-        self.cxl_device.pio = bus.mem_side_ports
-        if dma_ports.count(self.cxl_device.dma) == 0:
-            self.cxl_device.dma = bus.cpu_side_ports
-            if hasattr(self.cxl_device, 'cxl_rsp_port'):
-                self.cxl_device.cxl_rsp_port = bus.mem_side_ports
+        # CXL devices: named cxl_dev0, cxl_dev1, ...
+        cxl_devs = []
+        for i in range(100):
+            if hasattr(self, f'cxl_dev{i}'):
+                cxl_devs.append(getattr(self, f'cxl_dev{i}'))
+            else:
+                break
+        if not cxl_devs and hasattr(self, 'cxl_device'):
+            cxl_devs = [self.cxl_device]
+        for dev in cxl_devs:
+            dev.pio = bus.mem_side_ports
+            if dma_ports.count(dev.dma) == 0:
+                dev.dma = bus.cpu_side_ports
+                if hasattr(dev, 'cxl_rsp_port'):
+                    dev.cxl_rsp_port = bus.mem_side_ports
         self.keyboard.pio = bus.mem_side_ports
         self.pic1.pio = bus.mem_side_ports
         self.pic2.pio = bus.mem_side_ports
