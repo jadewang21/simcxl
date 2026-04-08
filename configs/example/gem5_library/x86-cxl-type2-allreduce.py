@@ -50,6 +50,9 @@ parser.add_argument("--prefetch-ownership", action="store_true", default=False,
                     help="Enable prefetch-for-ownership: overlap GETX with RS Compute (Mode 10)")
 parser.add_argument("--num-l2-banks", type=int, default=1,
                     help="Number of L2 cache banks (default 1)")
+parser.add_argument("--cxl-link-latency", type=int, default=120,
+                    help="CXL link latency in cycles for HBM Dir ext_links "
+                         "(models Host<->NPU traversal; ~50ns at 2.4GHz)")
 args = parser.parse_args()
 
 requires(
@@ -66,6 +69,7 @@ cache_hierarchy = CXLMESITwoLevelCacheHierarchy(
     l2_size="512KiB",
     l2_assoc=16,
     num_l2_banks=args.num_l2_banks,
+    cxl_link_latency=args.cxl_link_latency,
 )
 
 memory = DIMM_DDR5_4400(size="3GiB")
@@ -127,5 +131,6 @@ print(f"[AllReduce] mode={args.lsu_mode}, lsu_num={args.lsu_num}, "
       f"compute_lat={args.compute_lat}, "
       f"hbm_per_npu={args.hbm_per_npu if args.num_npus > 1 else '8GB'}, "
       f"prefetch_ownership={args.prefetch_ownership}, "
-      f"num_l2_banks={args.num_l2_banks}, cxl_dram=HBM2")
+      f"num_l2_banks={args.num_l2_banks}, "
+      f"cxl_link_latency={args.cxl_link_latency}, cxl_dram=HBM2")
 simulator.run()

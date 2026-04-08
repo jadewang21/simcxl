@@ -43,28 +43,32 @@ class SimplePt2Pt(SimpleNetwork):
         # https://gem5.atlassian.net/browse/GEM5-1039
         self.ruby_system = ruby_system
 
-    def connectControllers(self, controllers):
-        """Connect all of the controllers to routers and connec the routers
+    def connectControllers(self, controllers,
+                           cxl_node_indices=None, cxl_link_latency=1):
+        """Connect all of the controllers to routers and connect the routers
         together in a point-to-point network.
+
+        cxl_node_indices: set of controller indices whose ext_links should
+            use cxl_link_latency (models CXL link traversal to remote NPU).
+        cxl_link_latency: latency in cycles for CXL-attached ext_links.
         """
-        # Create one router/switch per controller in the system
         self.routers = [Switch(router_id=i) for i in range(len(controllers))]
 
-        # Make a link from each controller to the router. The link goes
-        # externally to the network.
         self.ext_links = [
-            SimpleExtLink(link_id=i, ext_node=c, int_node=self.routers[i])
+            SimpleExtLink(
+                link_id=i, ext_node=c, int_node=self.routers[i],
+                latency=cxl_link_latency
+                    if (cxl_node_indices and i in cxl_node_indices) else 1,
+            )
             for i, c in enumerate(controllers)
         ]
 
-        # Make an "internal" link (internal to the network) between every pair
-        # of routers.
         link_count = 0
         int_links = []
         for ri in self.routers:
             for rj in self.routers:
                 if ri == rj:
-                    continue  # Don't connect a router to itself!
+                    continue
                 link_count += 1
                 int_links.append(
                     SimpleIntLink(link_id=link_count, src_node=ri, dst_node=rj)

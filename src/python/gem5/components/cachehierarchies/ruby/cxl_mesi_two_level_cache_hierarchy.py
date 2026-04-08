@@ -66,6 +66,7 @@ class CXLMESITwoLevelCacheHierarchy(
         l2_size: str,
         l2_assoc: str,
         num_l2_banks: int,
+        cxl_link_latency: int = 1,
     ):
         AbstractRubyCacheHierarchy.__init__(self=self)
         AbstractTwoLevelCacheHierarchy.__init__(
@@ -79,6 +80,7 @@ class CXLMESITwoLevelCacheHierarchy(
         )
 
         self._num_l2_banks = num_l2_banks
+        self._cxl_link_latency = cxl_link_latency
 
     def incorporate_cache(self, board: AbstractBoard) -> None:
 
@@ -227,12 +229,25 @@ class CXLMESITwoLevelCacheHierarchy(
         if len(self._dma_controllers) != 0:
             self.ruby_system.dma_controllers = self._dma_controllers
 
-        # Create the network and connect the controllers.
+        # Compute controller indices for HBM Directories (need CXL link latency).
+        # Layout: [L1_controllers..., L2_controllers..., Dir_controllers..., DMA...]
+        # Host Dir(s) come first in _directory_controllers, then HBM Dirs.
+        all_controllers = (self._l1_controllers
+                           + self._l2_controllers
+                           + self._directory_controllers
+                           + self._dma_controllers)
+
+        hbm_dir_indices = set()
+        if self._cxl_link_latency > 1:
+            num_host_dirs = len(board.get_mem_ports())
+            base = len(self._l1_controllers) + len(self._l2_controllers)
+            for i in range(num_host_dirs, len(self._directory_controllers)):
+                hbm_dir_indices.add(base + i)
+
         self.ruby_system.network.connectControllers(
-            self._l1_controllers
-            + self._l2_controllers
-            + self._directory_controllers
-            + self._dma_controllers
+            all_controllers,
+            cxl_node_indices=hbm_dir_indices if hbm_dir_indices else None,
+            cxl_link_latency=self._cxl_link_latency,
         )
         self.ruby_system.network.setup_buffers()
 
