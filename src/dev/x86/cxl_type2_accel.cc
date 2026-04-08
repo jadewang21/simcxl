@@ -104,6 +104,7 @@ CXLType2Accel::CXLType2Accel(const Params &p)
         std::memset(dev_mem_bases, 0, sizeof(dev_mem_bases));
         for (int i = 0; i < MAX_DMC_SETS; i++) {
             dmc[i].valid = false;
+            dmc[i].dirty = false;
             dmc[i].tag = 0;
         }
         if (dmc_sets > MAX_DMC_SETS)
@@ -161,6 +162,8 @@ CXLType2Accel::CXLStats::CXLStats(CXLType2Accel &_ctrl)
                "DMC (device memory cache) hit count"),
       ADD_STAT(dmcMisses, statistics::units::Count::get(),
                "DMC (device memory cache) miss count"),
+      ADD_STAT(dmcWritebacks, statistics::units::Count::get(),
+               "DMC dirty line writeback count"),
       ADD_STAT(reqQueFullEvents, statistics::units::Count::get(),
                "Number of times the request queue has become full"),
       ADD_STAT(reqRetryCounts, statistics::units::Count::get(),
@@ -643,39 +646,10 @@ void
 CXLType2Accel::sendDataD2D(PacketPtr pkt, bool read)
 {
     Addr addr = pkt->getAddr();
-    int set_index = (addr / cacheLineSize) % dmc_sets;
-    Addr tag = addr / cacheLineSize / dmc_sets;
 
-    if (read && dmc_sets > 0 &&
-        dmc[set_index].valid && dmc[set_index].tag == tag) {
-        // DMC hit on read — return data after DMC hit latency
-        stats.dmcHits++;
-        DPRINTF(CXLType1Accel,
-                "D2D DMC HIT read addr %#x set=%d, cur_num: %d\n",
-                addr, set_index, cur_num);
-        delete pkt;
-        auto *event = new EventFunctionWrapper(
-            [this]() { d2dResponseComplete(); }, name(), true);
-        schedule(event, clockEdge(dmcHitLatency));
-        cur_num++;
-        if (cur_num < paddr.num)
-            stage1();
-    } else {
-        // DMC miss (or write): send to HBM via devMemPort
+    if (dmc_sets <= 0) {
         stats.dmcMisses++;
-
-        if (dmc_sets > 0) {
-            dmc[set_index].valid = true;
-            dmc[set_index].tag = tag;
-        }
-
-        DPRINTF(CXLType1Accel,
-                "D2D DMC %s %s addr %#x set=%d → devMemPort, cur_num: %d\n",
-                read ? "MISS" : "WRITE", read ? "read" : "write",
-                addr, set_index, cur_num);
-
         if (!devMemPort.sendTimingReq(pkt)) {
-            DPRINTF(CXLType1Accel, "D2D send failed, will retry\n");
             devmem_pkt = pkt;
         } else {
             devmem_pkt = nullptr;
@@ -683,6 +657,72 @@ CXLType2Accel::sendDataD2D(PacketPtr pkt, bool read)
             if (cur_num < paddr.num)
                 stage1();
         }
+        return;
+    }
+
+    int set_index = (addr / cacheLineSize) % dmc_sets;
+    Addr tag = addr / cacheLineSize / dmc_sets;
+    bool hit = dmc[set_index].valid && dmc[set_index].tag == tag;
+
+    if (read) {
+        if (hit) {
+            stats.dmcHits++;
+            DPRINTF(CXLType1Accel,
+                    "D2D DMC READ HIT addr %#x set=%d, cur_num: %d\n",
+                    addr, set_index, cur_num);
+            delete pkt;
+            auto *event = new EventFunctionWrapper(
+                [this]() { d2dResponseComplete(); }, name(), true);
+            schedule(event, clockEdge(dmcHitLatency));
+            cur_num++;
+            if (cur_num < paddr.num)
+                stage1();
+        } else {
+            stats.dmcMisses++;
+            if (dmc[set_index].valid && dmc[set_index].dirty)
+                stats.dmcWritebacks++;
+            dmc[set_index].valid = true;
+            dmc[set_index].dirty = false;
+            dmc[set_index].tag = tag;
+            DPRINTF(CXLType1Accel,
+                    "D2D DMC READ MISS addr %#x set=%d → HBM, cur_num: %d\n",
+                    addr, set_index, cur_num);
+            if (!devMemPort.sendTimingReq(pkt)) {
+                devmem_pkt = pkt;
+            } else {
+                devmem_pkt = nullptr;
+                cur_num++;
+                if (cur_num < paddr.num)
+                    stage1();
+            }
+        }
+    } else {
+        // Write-back DMC: writes complete at SRAM speed.
+        // Full cache line writes don't need to fetch old data.
+        if (hit) {
+            stats.dmcHits++;
+            DPRINTF(CXLType1Accel,
+                    "D2D DMC WRITE HIT addr %#x set=%d, cur_num: %d\n",
+                    addr, set_index, cur_num);
+        } else {
+            stats.dmcMisses++;
+            if (dmc[set_index].valid && dmc[set_index].dirty)
+                stats.dmcWritebacks++;
+            dmc[set_index].valid = true;
+            dmc[set_index].tag = tag;
+            DPRINTF(CXLType1Accel,
+                    "D2D DMC WRITE MISS (alloc) addr %#x set=%d, cur_num: %d\n",
+                    addr, set_index, cur_num);
+        }
+        dmc[set_index].dirty = true;
+
+        delete pkt;
+        auto *event = new EventFunctionWrapper(
+            [this]() { d2dResponseComplete(); }, name(), true);
+        schedule(event, clockEdge(dmcHitLatency));
+        cur_num++;
+        if (cur_num < paddr.num)
+            stage1();
     }
 }
 

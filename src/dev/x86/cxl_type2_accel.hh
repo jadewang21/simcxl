@@ -161,11 +161,12 @@ class CXLType2Accel : public PciDevice
 
         // DMC (Device Memory Cache) — per MICRO'24 Section IV:
         // "A DCOH slice comprises device cache divided into HMC and DMC.
-        //  DMC stores data from device memory." 32KB, direct-mapped.
+        //  DMC stores data from device memory." 32KB, direct-mapped, write-back.
         struct DMCEntry {
             bool valid;
+            bool dirty;
             Addr tag;
-            DMCEntry() : valid(false), tag(0) {}
+            DMCEntry() : valid(false), dirty(false), tag(0) {}
         };
         static const int MAX_DMC_SETS = 512; // 32KB / 64B
 
@@ -515,6 +516,7 @@ class CXLType2Accel : public PciDevice
             statistics::Scalar arPrefetchLat;
             statistics::Scalar dmcHits;
             statistics::Scalar dmcMisses;
+            statistics::Scalar dmcWritebacks;
             statistics::Scalar reqQueFullEvents;
             statistics::Scalar reqRetryCounts;
             statistics::Scalar rspQueFullEvents;
