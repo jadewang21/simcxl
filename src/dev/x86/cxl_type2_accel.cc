@@ -124,7 +124,7 @@ CXLType2Accel::CXLType2Accel(const Params &p)
             DPRINTF(CXLType1Accel, "AllReduce mode=%d rounds=%d dev_mem_base=%#lx\n",
                     lsu_mode, allreduce_rounds, dev_mem_base);
         }
-        if (lsu_mode >= 7 && lsu_mode <= 10) {
+        if (lsu_mode >= 7 && lsu_mode <= 14) {
             DPRINTF(CXLType1Accel,
                     "RingAllReduce mode=%d npu_id=%d num_npus=%d lsu_num=%d "
                     "chunk_size=%d dev_mem_base=%#lx compute_lat=%llu\n",
@@ -152,6 +152,8 @@ CXLType2Accel::CXLStats::CXLStats(CXLType2Accel &_ctrl)
                "Ring AllReduce AllGather total read latency"),
       ADD_STAT(arAgWriteLat, statistics::units::Tick::get(),
                "Ring AllReduce AllGather total write latency"),
+      ADD_STAT(arNcpPushLat, statistics::units::Tick::get(),
+               "Ring AllReduce NC-P push phase latency"),
       ADD_STAT(arComputeReadLat, statistics::units::Tick::get(),
                "Ring AllReduce compute-read phase latency"),
       ADD_STAT(arRsComputeLat, statistics::units::Tick::get(),
@@ -262,7 +264,7 @@ CXLType2Accel::recvData(PacketPtr pkt)
     recv_num++;
     if (recv_num >= paddr.num) {
         DPRINTF(CXLType1Accel, "All LSU responses have been received!\n");
-        if (lsu_mode >= 5 && lsu_mode <= 10) {
+        if (lsu_mode >= 5 && lsu_mode <= 14) {
             arPhaseComplete();
         } else {
             LSUFinish();
@@ -295,29 +297,31 @@ CXLType2Accel::LSUFinish()
                 clockEdge() - first_issue_time);
     }
 
-    if (lsu_mode >= 7 && lsu_mode <= 10) {
+    if (lsu_mode >= 7 && lsu_mode <= 14) {
         stats.arRsReadLat = ar_rs_read_total;
         stats.arRsWriteLat = ar_rs_write_total;
         stats.arAgReadLat = ar_ag_read_total;
         stats.arAgWriteLat = ar_ag_write_total;
-        if (lsu_mode == 9 || lsu_mode == 10)
+        if (lsu_mode >= 9 && lsu_mode <= 14)
             stats.arRsComputeLat = ar_rs_compute_total;
+        if (lsu_mode == 12)
+            stats.arNcpPushLat = ar_ncp_push_total;
 
         DPRINTF(CXLType1Accel,
                 "[NPU%d] RingAllReduce done: mode=%d npus=%d chunk=%d "
                 "RS_read=%llu RS_compute=%llu RS_write=%llu "
-                "AG_read=%llu AG_write=%llu "
+                "NCP_push=%llu AG_read=%llu AG_write=%llu "
                 "compute_read=%llu total=%llu\n",
                 npu_id, lsu_mode, num_npus, chunk_size,
                 ar_rs_read_total, ar_rs_compute_total, ar_rs_write_total,
-                ar_ag_read_total, ar_ag_write_total,
+                ar_ncp_push_total, ar_ag_read_total, ar_ag_write_total,
                 (Tick)stats.arComputeReadLat.value(),
                 clockEdge() - first_issue_time);
     }
 
     LSU_finished = 1;
 
-    if (lsu_mode >= 5 && lsu_mode <= 10) {
+    if (lsu_mode >= 5 && lsu_mode <= 14) {
         if (multiNpuMode()) {
             s_finished_count++;
             DPRINTF(CXLType1Accel,
@@ -339,8 +343,8 @@ CXLType2Accel::arPhaseComplete()
     Tick now = clockEdge();
     Tick phase_lat = now - ar_phase_start;
 
-    if (lsu_mode >= 7 && lsu_mode <= 10) {
-        const char *phase_names[] = {"RS", "AG", "Compute"};
+    if (lsu_mode >= 7 && lsu_mode <= 14) {
+        const char *phase_names[] = {"RS", "AG", "Compute", "NcpPush"};
 
         if (ar_is_read_phase) {
             if (ar_phase_type == 0)
@@ -357,6 +361,8 @@ CXLType2Accel::arPhaseComplete()
                 ar_rs_write_total += phase_lat;
             else if (ar_phase_type == 1)
                 ar_ag_write_total += phase_lat;
+            else if (ar_phase_type == 3)
+                ar_ncp_push_total += phase_lat;
 
             DPRINTF(CXLType1Accel,
                     "[NPU%d] Ring %s subround %d write done: %llu ticks\n",
@@ -400,9 +406,14 @@ CXLType2Accel::arStartPhase(bool is_read)
     cur_num = 0;
     recv_num = 0;
 
-    if (lsu_mode >= 7 && lsu_mode <= 10) {
-        paddr.num = (ar_phase_type == 2) ? lsu_num : chunk_size;
-        const char *phase_names[] = {"RS", "AG", "Compute"};
+    if (lsu_mode >= 7 && lsu_mode <= 14) {
+        if (ar_phase_type == 2)
+            paddr.num = lsu_num;
+        else if (ar_phase_type == 3)
+            paddr.num = (num_npus - 1) * chunk_size;
+        else
+            paddr.num = chunk_size;
+        const char *phase_names[] = {"RS", "AG", "Compute", "NcpPush"};
         DPRINTF(CXLType1Accel,
                 "Ring %s subround %d %s phase (%d requests)\n",
                 phase_names[ar_phase_type], ar_subround,
@@ -479,7 +490,7 @@ CXLType2Accel::d2dResponseComplete()
     recv_num++;
     if (recv_num >= paddr.num) {
         DPRINTF(CXLType1Accel, "All D2D responses received!\n");
-        if (lsu_mode >= 5 && lsu_mode <= 10) {
+        if (lsu_mode >= 5 && lsu_mode <= 14) {
             arPhaseComplete();
         } else {
             LSUFinish();
@@ -494,6 +505,14 @@ CXLType2Accel::arComputeDone()
             "[NPU%d] RS subround %d compute done\n",
             npu_id, ar_subround);
     ar_compute_done = true;
+    if ((lsu_mode == 11 || lsu_mode == 13 || lsu_mode == 14) &&
+        ar_prefetch_active) {
+        ar_waiting_for_prefetch = true;
+        DPRINTF(CXLType1Accel,
+                "[NPU%d] compute done, waiting for Mode %d prefetch\n",
+                npu_id, lsu_mode);
+        return;
+    }
     if (multiNpuMode()) {
         arBarrierReached();
     } else {
@@ -523,14 +542,36 @@ CXLType2Accel::issuePrefetchNext()
     if (pf_cur_num >= pf_total)
         return;
 
-    bool saved_read = ar_is_read_phase;
-    ar_is_read_phase = false;
-    Addr addr = getPhyAddr(pf_cur_num);
-    ar_is_read_phase = saved_read;
+    Addr addr;
+    if (lsu_mode == 11) {
+        int src = (npu_id - 1 + num_npus) % num_npus;
+        int co = ar_subround * chunk_size;
+        addr = dev_mem_bases[src] + (co + pf_cur_num) * cacheLineSize;
+    } else if (lsu_mode == 13) {
+        int co = ar_subround * chunk_size;
+        addr = paddr.phy +
+               ((1 + npu_id) * lsu_num + co + pf_cur_num) * cacheLineSize;
+    } else if (lsu_mode == 14) {
+        int co = ar_subround * chunk_size;
+        addr = dev_mem_base + (co + pf_cur_num) * cacheLineSize;
+    } else {
+        bool saved_read = ar_is_read_phase;
+        ar_is_read_phase = false;
+        addr = getPhyAddr(pf_cur_num);
+        ar_is_read_phase = saved_read;
+    }
 
     RequestPtr req = std::make_shared<Request>(addr, cacheLineSize, 0, 0);
-    PacketPtr pkt = Packet::createRead(req);
-    pkt->dataDynamic<uint8_t>(new uint8_t[cacheLineSize]);
+    PacketPtr pkt;
+    if (lsu_mode == 13 || lsu_mode == 14) {
+        pkt = Packet::createWrite(req);
+        uint8_t *data = new uint8_t[cacheLineSize];
+        std::memset(data, 0, cacheLineSize);
+        pkt->dataDynamic<uint8_t>(data);
+    } else {
+        pkt = Packet::createRead(req);
+        pkt->dataDynamic<uint8_t>(new uint8_t[cacheLineSize]);
+    }
 
     if (!dcachePort.sendTimingReq(pkt)) {
         DPRINTF(CXLType1Accel,
@@ -561,11 +602,18 @@ CXLType2Accel::pfResponseReceived()
         ar_prefetch_done = true;
         stats.arPrefetchLat = curTick() - pf_start_tick;
         DPRINTF(CXLType1Accel,
-                "[NPU%d] all ownership prefetches done (%llu ticks)\n",
+                "[NPU%d] all prefetches done (%llu ticks)\n",
                 npu_id, curTick() - pf_start_tick);
         if (ar_waiting_for_prefetch) {
             ar_waiting_for_prefetch = false;
-            arStartPhase(false);
+            if (lsu_mode == 11 || lsu_mode == 13 || lsu_mode == 14) {
+                if (multiNpuMode())
+                    arBarrierReached();
+                else
+                    arStartPhase(false);
+            } else {
+                arStartPhase(false);
+            }
         }
     }
 }
@@ -595,7 +643,7 @@ CXLType2Accel::arDoTransition()
             Tick phase_lat = clockEdge() - ar_phase_start;
             stats.arComputeReadLat = phase_lat;
             LSUFinish();
-        } else if ((lsu_mode == 9 || lsu_mode == 10) &&
+        } else if ((lsu_mode >= 9 && lsu_mode <= 14) &&
                    ar_phase_type == 0 && computeLatPerLine > 0 &&
                    !ar_compute_done) {
             Tick delay = (Tick)chunk_size * computeLatPerLine;
@@ -605,6 +653,10 @@ CXLType2Accel::arDoTransition()
                     npu_id, ar_subround, delay);
             schedule(computeDoneEvent, curTick() + delay);
             if (prefetchOwnership && lsu_mode == 10) {
+                startOwnershipPrefetch();
+            }
+            if ((lsu_mode == 11 || lsu_mode == 13 || lsu_mode == 14) &&
+                multiNpuMode()) {
                 startOwnershipPrefetch();
             }
         } else {
@@ -624,9 +676,26 @@ CXLType2Accel::arDoTransition()
     } else {
         ar_subround++;
         if (ar_phase_type == 0 && ar_subround >= num_npus - 1) {
+            if (lsu_mode == 12) {
+                ar_phase_type = 3;
+                ar_subround = 0;
+                DPRINTF(CXLType1Accel,
+                        "[NPU%d] RS complete, switching to NC-P Push\n",
+                        npu_id);
+                arStartPhase(false);
+            } else {
+                ar_phase_type = 1;
+                ar_subround = 0;
+                DPRINTF(CXLType1Accel,
+                        "[NPU%d] RS complete, switching to AG\n",
+                        npu_id);
+                arStartPhase(true);
+            }
+        } else if (ar_phase_type == 3) {
             ar_phase_type = 1;
             ar_subround = 0;
-            DPRINTF(CXLType1Accel, "[NPU%d] RS complete, switching to AG\n",
+            DPRINTF(CXLType1Accel,
+                    "[NPU%d] NC-P Push complete, switching to AG\n",
                     npu_id);
             arStartPhase(true);
         } else if (ar_phase_type == 1 && ar_subround >= num_npus - 1) {
@@ -936,6 +1005,87 @@ CXLType2Accel::getPhyAddr(int index)
             }
             break;
         }
+        case 12: {
+            int co = ar_subround * chunk_size;
+            int num = (ar_phase_type == 2) ? lsu_num :
+                      (ar_phase_type == 3) ? (num_npus - 1) * chunk_size :
+                      chunk_size;
+            int idx = index % num;
+
+            if (ar_phase_type == 0) {          // RS: same as Mode 9
+                if (ar_is_read_phase) {
+                    if (multiNpuMode() && ar_subround > 0) {
+                        int src = (npu_id - 1 + num_npus) % num_npus;
+                        phy_addr = dev_mem_bases[src] +
+                                   (co + idx) * cacheLineSize;
+                    } else {
+                        phy_addr = paddr.phy + (co + idx) * cacheLineSize;
+                    }
+                } else {
+                    phy_addr = dev_mem_base + (co + idx) * cacheLineSize;
+                }
+            } else if (ar_phase_type == 3) {   // NC-P Push to Host
+                phy_addr = paddr.phy +
+                           ((1 + npu_id) * lsu_num + idx) * cacheLineSize;
+            } else if (ar_phase_type == 1) {   // AG: read/write from Host
+                if (ar_is_read_phase) {
+                    if (multiNpuMode()) {
+                        int src = (npu_id - 1 + num_npus) % num_npus;
+                        phy_addr = paddr.phy +
+                                   ((1 + src) * lsu_num + co + idx) *
+                                   cacheLineSize;
+                    } else {
+                        phy_addr = paddr.phy +
+                                   (2 * lsu_num + co + idx) * cacheLineSize;
+                    }
+                } else {
+                    phy_addr = dev_mem_base +
+                               (lsu_num + co + idx) * cacheLineSize;
+                }
+            } else {                           // Compute Read
+                phy_addr = dev_mem_base + idx * cacheLineSize;
+            }
+            break;
+        }
+        case 13: {
+            int co = ar_subround * chunk_size;
+            int num = (ar_phase_type == 2) ? lsu_num : chunk_size;
+            int idx = index % num;
+
+            if (ar_phase_type == 0) {          // RS: same as Mode 9
+                if (ar_is_read_phase) {
+                    if (multiNpuMode() && ar_subround > 0) {
+                        int src = (npu_id - 1 + num_npus) % num_npus;
+                        phy_addr = dev_mem_bases[src] +
+                                   (co + idx) * cacheLineSize;
+                    } else {
+                        phy_addr = paddr.phy + (co + idx) * cacheLineSize;
+                    }
+                } else {
+                    phy_addr = dev_mem_base + (co + idx) * cacheLineSize;
+                }
+            } else if (ar_phase_type == 1) {   // AG: Read from predecessor Host
+                if (ar_is_read_phase) {
+                    if (multiNpuMode()) {
+                        int src = (npu_id - 1 + num_npus) % num_npus;
+                        phy_addr = paddr.phy +
+                                   ((1 + src) * lsu_num + co + idx) *
+                                   cacheLineSize;
+                    } else {
+                        phy_addr = paddr.phy +
+                                   (2 * lsu_num + co + idx) * cacheLineSize;
+                    }
+                } else {
+                    phy_addr = dev_mem_base +
+                               (lsu_num + co + idx) * cacheLineSize;
+                }
+            } else {                           // Compute Read
+                phy_addr = dev_mem_base + idx * cacheLineSize;
+            }
+            break;
+        }
+        case 14: // Mode 14: CO-Write to own HBM via Ruby + AG from predecessor HBM
+        case 11: // Mode 11: same addressing as Mode 9 + prefetch during compute
         case 9: {
             // Baseline HBM-Centric Ring AllReduce
             // Single-NPU: uses Host cold reads to simulate cross-NPU
@@ -1083,7 +1233,7 @@ CXLType2Accel::runLSU()
         first_issue_time = clockEdge();
     }
 
-    if (lsu_mode >= 7 && lsu_mode <= 10) {
+    if (lsu_mode >= 7 && lsu_mode <= 14) {
         // Populate dev_mem_bases from all registered NPUs
         for (auto *npu : s_all_npus)
             dev_mem_bases[npu->npu_id] = npu->dev_mem_base;
@@ -1107,6 +1257,7 @@ CXLType2Accel::runLSU()
                     npu->ar_ag_read_total = 0;
                     npu->ar_ag_write_total = 0;
                     npu->ar_rs_compute_total = 0;
+                    npu->ar_ncp_push_total = 0;
                     npu->ar_compute_done = false;
                     npu->ar_total_start = clockEdge();
                     DPRINTF(CXLType1Accel,
@@ -1124,6 +1275,7 @@ CXLType2Accel::runLSU()
         ar_ag_read_total = 0;
         ar_ag_write_total = 0;
         ar_rs_compute_total = 0;
+        ar_ncp_push_total = 0;
         ar_total_start = clockEdge();
         arStartPhase(true);
     } else if (lsu_mode == 5 || lsu_mode == 6) {
@@ -1149,7 +1301,7 @@ CXLType2Accel::stage2()
 {
     stage = 2;
     bool is_read;
-    if (lsu_mode >= 5 && lsu_mode <= 10)
+    if (lsu_mode >= 5 && lsu_mode <= 14)
         is_read = ar_is_read_phase;
     else
         is_read = (load_store == 1);

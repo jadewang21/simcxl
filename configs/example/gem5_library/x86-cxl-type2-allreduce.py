@@ -35,7 +35,10 @@ from gem5.resources.resource import KernelResource, DiskImageResource
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--lsu-mode", type=int, default=9,
-                    help="5/6: simplified; 7/8: CBC 1.0; 9: Baseline HBM-Centric; 10: Host-Centric CBC 2.0")
+                    help="9: Baseline HBM-Centric; 10: Host-Centric CBC 2.0; "
+                         "11: Mode 9 + COP Prefetch; 12: D2D Write + NC-P Push + Host AG Read; "
+                         "13: CO-Write to Host + Host AG Read; "
+                         "14: CO-Write to own HBM via Ruby + distributed HBM Dir AG Read")
 parser.add_argument("--lsu-num", type=int, default=2048,
                     help="Total cachelines in AllReduce buffer")
 parser.add_argument("--allreduce-rounds", type=int, default=4,

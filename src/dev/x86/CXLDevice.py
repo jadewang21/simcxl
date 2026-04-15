@@ -107,7 +107,7 @@ class CXLType2Accel(PciDevice):
     cxl_mem_range = Param.AddrRange("2GB", "CXL expander memory range that can be identified as system memory")
     dmc_size = Param.MemorySize("32kB", "DMC size per MICRO'24 (0 = disabled)")
     dmc_hit_latency = Param.Latency("5ns", "DMC hit latency (MICRO'24: similar to HMC hit)")
-    lsu_mode = Param.Int(1, "1: single-point; 2: sequential; 3: random; 5/6: simplified AllReduce; 7/8: Ring AR CBC 1.0; 9: Baseline HBM-Centric; 10: Host-Centric CBC 2.0")
+    lsu_mode = Param.Int(1, "1: single-point; 2: sequential; 3: random; 5/6: simplified AllReduce; 7/8: Ring AR CBC 1.0; 9: Baseline HBM-Centric; 10: Host-Centric CBC 2.0; 11: Mode 9 + L2 Injection Prefetch")
     lsu_num = Param.Int(1, "Number of cacheline requests per phase")
     load_store = Param.Int(1, "1 for load; 2 for store (ignored in modes 5-10)")
     allreduce_rounds = Param.Int(4, "Number of AllReduce rounds (modes 5/6)")

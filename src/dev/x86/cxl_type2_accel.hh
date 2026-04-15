@@ -209,6 +209,7 @@ class CXLType2Accel : public PciDevice
         Tick ar_rs_write_total;
         Tick ar_ag_read_total;
         Tick ar_ag_write_total;
+        Tick ar_ncp_push_total;
 
         // Compute delay for reduction (modes 9/10)
         Tick computeLatPerLine;  // ticks per cache line for reduction compute
@@ -511,6 +512,7 @@ class CXLType2Accel : public PciDevice
             statistics::Scalar arRsWriteLat;
             statistics::Scalar arAgReadLat;
             statistics::Scalar arAgWriteLat;
+            statistics::Scalar arNcpPushLat;
             statistics::Scalar arComputeReadLat;
             statistics::Scalar arRsComputeLat;
             statistics::Scalar arPrefetchLat;
