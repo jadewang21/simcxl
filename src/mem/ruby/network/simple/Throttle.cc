@@ -40,6 +40,7 @@
 
 #include "mem/ruby/network/simple/Throttle.hh"
 
+#include <algorithm>
 #include <cassert>
 
 #include "base/cast.hh"
@@ -128,6 +129,7 @@ Throttle::addLinks(const std::vector<MessageBuffer*>& in_vec,
     }
 
     m_vnets = in_vec.size();
+    m_next_arrival_tick.assign(m_vnets, 0);
 
     gem5_assert(m_physical_vnets ?
            (m_link_bandwidth_multiplier.size() == m_vnets) :
@@ -242,59 +244,134 @@ Throttle::operateVnet(int vnet, int channel, int &total_bw_remaining,
 void
 Throttle::wakeup()
 {
-    // Limits the number of message sent to a limited number of bytes/cycle.
+    // Approximate the link as a base latency plus a serialization delay.
+    // Ready messages sharing the same link in the same cycle divide the link
+    // bandwidth equally. This is a better fit for collective communication
+    // studies than the original FIFO-dominant throttling behavior.
     assert(getTotalLinkBandwidth() > 0);
-    int bw_remaining = getTotalLinkBandwidth();
+    Tick current_time = m_switch->clockEdge();
+    const int total_link_bw = getTotalLinkBandwidth();
+
+    m_active_transfers.erase(
+        std::remove_if(
+            m_active_transfers.begin(),
+            m_active_transfers.end(),
+            [current_time](Tick done_tick) { return done_tick <= current_time; }
+        ),
+        m_active_transfers.end()
+    );
+
+    bool output_blocked = false;
+    std::vector<int> ready_vnets;
+    ready_vnets.reserve(m_vnets);
 
     m_wakeups_wo_switch++;
-    bool bw_saturated = false;
-    bool output_blocked = false;
-
-    // variable for deciding the direction in which to iterate
-    bool iteration_direction = false;
-
-
-    // invert priorities to avoid starvation seen in the component network
+    bool reverse_priority = false;
     if (m_wakeups_wo_switch > PRIORITY_SWITCH_LIMIT) {
         m_wakeups_wo_switch = 0;
-        iteration_direction = true;
+        reverse_priority = true;
     }
 
-    if (iteration_direction) {
+    auto consider_vnet = [&](int vnet) {
+        MessageBuffer *in = m_in[vnet];
+        MessageBuffer *out = m_out[vnet];
+        if (in == nullptr || out == nullptr) {
+            return;
+        }
+        if (!in->isReady(current_time)) {
+            return;
+        }
+        if (!out->areNSlotsAvailable(1, current_time)) {
+            output_blocked = true;
+            return;
+        }
+        ready_vnets.push_back(vnet);
+    };
+
+    if (reverse_priority) {
         for (int vnet = 0; vnet < m_vnets; ++vnet) {
-            for (int channel = 0; channel < getChannelCnt(vnet); ++channel) {
-                operateVnet(vnet, channel, bw_remaining,
-                            bw_saturated, output_blocked,
-                            m_in[vnet], m_out[vnet]);
-            }
+            consider_vnet(vnet);
         }
     } else {
-        for (int vnet = m_vnets-1; vnet >= 0; --vnet) {
-            for (int channel = 0; channel < getChannelCnt(vnet); ++channel) {
-                operateVnet(vnet, channel, bw_remaining,
-                            bw_saturated, output_blocked,
-                            m_in[vnet], m_out[vnet]);
-            }
+        for (int vnet = m_vnets - 1; vnet >= 0; --vnet) {
+            consider_vnet(vnet);
         }
     }
 
-    // We should only wake up when we use the bandwidth
-    // This is only mostly true
-    // assert(bw_remaining != getLinkBandwidth());
+    const int concurrent_flows =
+        static_cast<int>(m_active_transfers.size() + ready_vnets.size());
+    const int per_flow_bw = concurrent_flows > 0 ?
+        std::max(1, total_link_bw / concurrent_flows) :
+        total_link_bw;
 
-    // Record that we used some or all of the link bandwidth this cycle
-    double ratio = 1.0 - (double(bw_remaining) /
-                         double(getTotalLinkBandwidth()));
+    for (int vnet : ready_vnets) {
+        MessageBuffer *in = m_in[vnet];
+        MessageBuffer *out = m_out[vnet];
 
-    // If ratio = 0, we used no bandwidth, if ratio = 1, we used all
-    throttleStats.acc_link_utilization += ratio;
+        MsgPtr msg_ptr = in->peekMsgPtr();
+        Message *net_msg_ptr = msg_ptr.get();
+        Tick msg_enqueue_time = msg_ptr->getLastEnqueueTime();
+        const int msg_units = network_message_to_size(net_msg_ptr);
+        const int transfer_cycles =
+            std::max(1, (msg_units + per_flow_bw - 1) / per_flow_bw);
 
-    if (bw_saturated) throttleStats.total_bw_sat_cy += 1;
-    if (output_blocked) throttleStats.total_stall_cy += 1;
+        DPRINTF(RubyNetwork,
+                "throttle analytical-share: node=%d flows=%d per_flow_bw=%d "
+                "msg_units=%d transfer_cycles=%d time=%lld.\n",
+                m_node, concurrent_flows, per_flow_bw, msg_units,
+                transfer_cycles, m_ruby_system->curCycle());
 
-    if (bw_saturated || output_blocked) {
-        // We are out of bandwidth for this cycle, so wakeup next
-        // cycle and continue
+        in->dequeue(current_time);
+
+        Tick arrival_tick =
+            current_time +
+            m_switch->cyclesToTicks(m_link_latency + Cycles(transfer_cycles));
+        if (arrival_tick < m_next_arrival_tick[vnet]) {
+            arrival_tick = m_next_arrival_tick[vnet];
+        }
+
+        out->enqueue(
+            msg_ptr,
+            current_time,
+            arrival_tick - current_time
+        );
+        m_next_arrival_tick[vnet] = arrival_tick;
+
+        m_active_transfers.push_back(
+            current_time + m_switch->cyclesToTicks(Cycles(transfer_cycles))
+        );
+
+        (*(throttleStats.msg_counts[net_msg_ptr->getMessageSize()]))[vnet]++;
+        throttleStats.total_msg_count += 1;
+        uint32_t total_size =
+            Network::MessageSizeType_to_int(net_msg_ptr->getMessageSize());
+        throttleStats.total_msg_bytes += total_size;
+        total_size -=
+            Network::MessageSizeType_to_int(MessageSizeType_Control);
+        throttleStats.total_data_msg_bytes += total_size;
+        throttleStats.total_msg_wait_time += current_time - msg_enqueue_time;
+    }
+
+    const bool link_active = !m_active_transfers.empty() || !ready_vnets.empty();
+    throttleStats.acc_link_utilization += link_active ? 1.0 : 0.0;
+
+    if (concurrent_flows > 1) {
+        throttleStats.total_bw_sat_cy += 1;
+    }
+    if (output_blocked) {
+        throttleStats.total_stall_cy += 1;
+    }
+
+    bool pending_work = false;
+    for (int vnet = 0; vnet < m_vnets; ++vnet) {
+        MessageBuffer *in = m_in[vnet];
+        if (in != nullptr && in->isReady(current_time)) {
+            pending_work = true;
+            break;
+        }
+    }
+
+    if (pending_work || output_blocked || !m_active_transfers.empty()) {
         DPRINTF(RubyNetwork, "%s scheduled again\n", *this);
         scheduleEvent(Cycles(1));
     }

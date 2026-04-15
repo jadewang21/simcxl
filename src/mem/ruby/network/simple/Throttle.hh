@@ -120,6 +120,8 @@ class Throttle : public Consumer
     std::vector<MessageBuffer*> m_out;
     unsigned int m_vnets;
     std::vector<std::vector<int>> m_units_remaining;
+    std::vector<Tick> m_active_transfers;
+    std::vector<Tick> m_next_arrival_tick;
 
     const int m_switch_id;
     Switch *m_switch;

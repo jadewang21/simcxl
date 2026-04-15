@@ -43,25 +43,41 @@ class SimplePt2Pt(SimpleNetwork):
         # https://gem5.atlassian.net/browse/GEM5-1039
         self.ruby_system = ruby_system
 
-    def connectControllers(self, controllers,
-                           cxl_node_indices=None, cxl_link_latency=1):
+    def connectControllers(
+        self,
+        controllers,
+        cxl_node_indices=None,
+        cxl_link_latency=1,
+        controller_bandwidth_factors=None,
+    ):
         """Connect all of the controllers to routers and connect the routers
         together in a point-to-point network.
 
         cxl_node_indices: set of controller indices whose ext_links should
             use cxl_link_latency (models CXL link traversal to remote NPU).
         cxl_link_latency: latency in cycles for CXL-attached ext_links.
+        controller_bandwidth_factors: optional map from controller index to
+            ext_link bandwidth_factor. This lets selected endpoints model a
+            slower CXL link while leaving the rest of the Ruby network intact.
         """
+        controller_bandwidth_factors = controller_bandwidth_factors or {}
         self.routers = [Switch(router_id=i) for i in range(len(controllers))]
 
-        self.ext_links = [
-            SimpleExtLink(
-                link_id=i, ext_node=c, int_node=self.routers[i],
-                latency=cxl_link_latency
-                    if (cxl_node_indices and i in cxl_node_indices) else 1,
-            )
-            for i, c in enumerate(controllers)
-        ]
+        self.ext_links = []
+        for i, controller in enumerate(controllers):
+            link_kwargs = {
+                "link_id": i,
+                "ext_node": controller,
+                "int_node": self.routers[i],
+                "latency": (
+                    cxl_link_latency
+                    if (cxl_node_indices and i in cxl_node_indices)
+                    else 1
+                ),
+            }
+            if i in controller_bandwidth_factors:
+                link_kwargs["bandwidth_factor"] = controller_bandwidth_factors[i]
+            self.ext_links.append(SimpleExtLink(**link_kwargs))
 
         link_count = 0
         int_links = []

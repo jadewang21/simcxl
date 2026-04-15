@@ -67,6 +67,7 @@ class CXLMESITwoLevelCacheHierarchy(
         l2_assoc: str,
         num_l2_banks: int,
         cxl_link_latency: int = 1,
+        cxl_link_bandwidth_factor=None,
     ):
         AbstractRubyCacheHierarchy.__init__(self=self)
         AbstractTwoLevelCacheHierarchy.__init__(
@@ -81,6 +82,7 @@ class CXLMESITwoLevelCacheHierarchy(
 
         self._num_l2_banks = num_l2_banks
         self._cxl_link_latency = cxl_link_latency
+        self._cxl_link_bandwidth_factor = cxl_link_bandwidth_factor
 
     def incorporate_cache(self, board: AbstractBoard) -> None:
 
@@ -143,6 +145,7 @@ class CXLMESITwoLevelCacheHierarchy(
             self._l1_controllers.append(cache)
 
         # Create one L1 cache (HMC) per CXL NPU
+        num_cpu_l1_controllers = len(self._l1_controllers)
         cxl_devs = []
         for i in range(100):
             if hasattr(board.pc.south_bridge, f'cxl_dev{i}'):
@@ -244,10 +247,21 @@ class CXLMESITwoLevelCacheHierarchy(
             for i in range(num_host_dirs, len(self._directory_controllers)):
                 hbm_dir_indices.add(base + i)
 
+        controller_bandwidth_factors = {}
+        if self._cxl_link_bandwidth_factor:
+            for i in range(num_cpu_l1_controllers, len(self._l1_controllers)):
+                controller_bandwidth_factors[i] = self._cxl_link_bandwidth_factor
+            for i in hbm_dir_indices:
+                controller_bandwidth_factors[i] = self._cxl_link_bandwidth_factor
+
         self.ruby_system.network.connectControllers(
             all_controllers,
             cxl_node_indices=hbm_dir_indices if hbm_dir_indices else None,
             cxl_link_latency=self._cxl_link_latency,
+            controller_bandwidth_factors=(
+                controller_bandwidth_factors
+                if controller_bandwidth_factors else None
+            ),
         )
         self.ruby_system.network.setup_buffers()
 

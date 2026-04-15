@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import re
 
 from gem5.utils.requires import requires
 from gem5.coherence_protocol import CoherenceProtocol
@@ -32,6 +33,30 @@ from gem5.isas import ISA
 from gem5.simulate.exit_event import ExitEvent
 from gem5.simulate.simulator import Simulator
 from gem5.resources.resource import KernelResource, DiskImageResource
+
+
+def freq_to_hz(freq_str: str) -> float:
+    match = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*([KMG]?Hz)\s*", freq_str)
+    if not match:
+        raise ValueError(f"Unsupported frequency string: {freq_str}")
+
+    value = float(match.group(1))
+    unit = match.group(2)
+    scale = {
+        "Hz": 1.0,
+        "KHz": 1.0e3,
+        "MHz": 1.0e6,
+        "GHz": 1.0e9,
+    }[unit]
+    return value * scale
+
+
+def bandwidth_gbs_to_factor(bandwidth_gbs: float, clk_freq: str):
+    if bandwidth_gbs <= 0:
+        return None
+
+    bytes_per_cycle = (bandwidth_gbs * 1.0e9) / freq_to_hz(clk_freq)
+    return max(1, int(round(bytes_per_cycle)))
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--lsu-mode", type=int, default=9,
@@ -56,12 +81,21 @@ parser.add_argument("--num-l2-banks", type=int, default=1,
 parser.add_argument("--cxl-link-latency", type=int, default=120,
                     help="CXL link latency in cycles for HBM Dir ext_links "
                          "(models Host<->NPU traversal; ~50ns at 2.4GHz)")
+parser.add_argument("--cxl-link-bandwidth", type=float, default=0.0,
+                    help="Effective single-direction CXL link bandwidth in "
+                         "GB/s. 0 disables CXL bandwidth throttling.")
 args = parser.parse_args()
 
 requires(
     isa_required=ISA.X86,
     coherence_protocol_required=CoherenceProtocol.CXL_MESI_TWO_LEVEL,
     kvm_required=True,
+)
+
+board_clk_freq = "2.4GHz"
+cxl_link_bandwidth_factor = bandwidth_gbs_to_factor(
+    args.cxl_link_bandwidth,
+    board_clk_freq,
 )
 
 cache_hierarchy = CXLMESITwoLevelCacheHierarchy(
@@ -73,6 +107,7 @@ cache_hierarchy = CXLMESITwoLevelCacheHierarchy(
     l2_assoc=16,
     num_l2_banks=args.num_l2_banks,
     cxl_link_latency=args.cxl_link_latency,
+    cxl_link_bandwidth_factor=cxl_link_bandwidth_factor,
 )
 
 memory = DIMM_DDR5_4400(size="3GiB")
@@ -94,7 +129,7 @@ for proc in processor.start:
     proc.core.usePerf = False
 
 board = X86BoardCXLType2(
-    clk_freq="2.4GHz",
+    clk_freq=board_clk_freq,
     processor=processor,
     memory=memory,
     cache_hierarchy=cache_hierarchy,
@@ -135,5 +170,7 @@ print(f"[AllReduce] mode={args.lsu_mode}, lsu_num={args.lsu_num}, "
       f"hbm_per_npu={args.hbm_per_npu if args.num_npus > 1 else '8GB'}, "
       f"prefetch_ownership={args.prefetch_ownership}, "
       f"num_l2_banks={args.num_l2_banks}, "
-      f"cxl_link_latency={args.cxl_link_latency}, cxl_dram=HBM2")
+      f"cxl_link_latency={args.cxl_link_latency}, "
+      f"cxl_link_bandwidth={args.cxl_link_bandwidth}GB/s, "
+      f"cxl_bw_factor={cxl_link_bandwidth_factor}, cxl_dram=HBM2")
 simulator.run()
