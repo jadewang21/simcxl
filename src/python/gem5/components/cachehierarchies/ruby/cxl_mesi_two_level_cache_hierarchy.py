@@ -166,7 +166,7 @@ class CXLMESITwoLevelCacheHierarchy(
                 board.get_clock_domain(),
                 l1_request_latency=544,
                 l1_response_latency=544,
-                mandatory_queue_latency=276
+                mandatory_queue_latency=12
             )
             cxl_cache.sequencer = RubySequencer(
                 version=len(self._l1_controllers),
