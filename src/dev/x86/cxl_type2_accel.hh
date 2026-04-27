@@ -227,6 +227,8 @@ class CXLType2Accel : public PciDevice
 
         // Prefetch-for-ownership: overlap GETX prefetch with RS Compute
         bool prefetchOwnership;
+        const bool disable_rs_pf;
+        const bool disable_ag_pf;
         bool ar_prefetch_active;
         bool ar_prefetch_done;
         bool ar_waiting_for_prefetch;

@@ -1,4 +1,5 @@
 #include <cstring>
+#include <cstdlib>
 #include <random>
 
 #include "base/trace.hh"
@@ -78,6 +79,8 @@ CXLType2Accel::CXLType2Accel(const Params &p)
     computeDoneEvent([this]{ arComputeDone(); }, name()),
     barrierLatency(p.barrier_latency),
     prefetchOwnership(p.prefetch_ownership),
+    disable_rs_pf(std::getenv("CXLRH_DISABLE_RS_PREFETCH") != nullptr),
+    disable_ag_pf(std::getenv("CXLRH_DISABLE_AG_PREFETCH") != nullptr),
     ar_prefetch_active(false),
     ar_prefetch_done(false),
     ar_waiting_for_prefetch(false),
@@ -864,7 +867,7 @@ CXLType2Accel::arDoTransition()
                 DPRINTF(CXLType1Accel,
                         "[NPU%d] RS complete, switching to AG\n",
                         npu_id);
-                if (lsu_mode == 15 && num_npus >= 4) {
+                if (lsu_mode == 15 && num_npus >= 4 && !disable_ag_pf) {
                     ag_pf_in_flight = true;
                     ar_prefetch_done = false;
                     DPRINTF(CXLType1Accel,
@@ -900,7 +903,7 @@ CXLType2Accel::arDoTransition()
                 arStartPhase(true);
             }
         } else {
-            if (lsu_mode == 15 && num_npus >= 4 &&
+            if (lsu_mode == 15 && num_npus >= 4 && !disable_rs_pf &&
                 ar_phase_type == 0 && ar_subround == 1) {
                 ar_concurrent_prefetch = true;
                 ar_prefetch_done = false;
