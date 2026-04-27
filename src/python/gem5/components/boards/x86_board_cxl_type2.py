@@ -87,6 +87,7 @@ class X86BoardCXLType2(AbstractSystemBoard, KernelDiskWorkload):
         num_npus: int = 4,
         compute_lat_per_line: str = "40ns",
         prefetch_ownership: bool = False,
+        barrier_latency: str = "0ns",
     ) -> None:
         if isinstance(cxl_memory, list):
             self._cxl_memories = cxl_memory
@@ -100,6 +101,7 @@ class X86BoardCXLType2(AbstractSystemBoard, KernelDiskWorkload):
         self._num_npus = num_npus
         self._compute_lat_per_line = compute_lat_per_line
         self._prefetch_ownership = prefetch_ownership
+        self._barrier_latency = barrier_latency
 
         super().__init__(
             clk_freq=clk_freq,
@@ -173,7 +175,8 @@ class X86BoardCXLType2(AbstractSystemBoard, KernelDiskWorkload):
                     self._lsu_mode, self._lsu_num, self._load_store,
                     self._allreduce_rounds, self._num_npus,
                     self._compute_lat_per_line, npu_id=i,
-                    prefetch_ownership=self._prefetch_ownership)
+                    prefetch_ownership=self._prefetch_ownership,
+                    barrier_latency=self._barrier_latency)
 
         print("LSU mode:", self._lsu_mode, "LSU num:", self._lsu_num,
                 "LSU load_store:", self._load_store,

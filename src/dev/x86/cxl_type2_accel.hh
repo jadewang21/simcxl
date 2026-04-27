@@ -2,6 +2,7 @@
 #define __DEV_X86_CXL_TYPE2_ACCEL_HH__
 
 #include <deque>
+#include <unordered_set>
 #include <vector>
 
 #include "base/addr_range.hh"
@@ -211,6 +212,13 @@ class CXLType2Accel : public PciDevice
         Tick ar_ag_write_total;
         Tick ar_ncp_push_total;
 
+        // Per-subround timing for fine-grained analysis
+        static const int MAX_SUBROUNDS = 16;
+        Tick rs_read_per_sub[MAX_SUBROUNDS];
+        Tick rs_write_per_sub[MAX_SUBROUNDS];
+        Tick ag_read_per_sub[MAX_SUBROUNDS];
+        Tick ag_write_per_sub[MAX_SUBROUNDS];
+
         // Compute delay for reduction (modes 9/10)
         Tick computeLatPerLine;  // ticks per cache line for reduction compute
         Tick ar_rs_compute_total;
@@ -232,6 +240,19 @@ class CXLType2Accel : public PciDevice
         void issuePrefetchNext();
         void pfResponseReceived();
 
+        // Mode 15: concurrent prefetch uses address-based response routing
+        // instead of the ar_prefetch_active flag, allowing main reads and
+        // prefetch to be in-flight simultaneously.
+        std::unordered_set<Addr> pf_pending_addrs;
+        bool ar_concurrent_prefetch;
+        bool pf_ag_mode;  // true → prefetch targets AG Step 1 original holders
+        bool ag_pf_in_flight;  // AG prefetch running in background
+
+        void startAgPrefetch();
+
+        // Barrier latency model
+        Tick barrierLatency;
+
         // Multi-NPU coordination
         static const int MAX_NPUS = 16;
         static std::vector<CXLType2Accel*> s_all_npus;
@@ -239,6 +260,7 @@ class CXLType2Accel : public PciDevice
         static int s_finished_count;
         Addr dev_mem_bases[MAX_NPUS];
         bool multiNpuMode() const { return s_all_npus.size() > 1; }
+        bool tree17IsActive(int phase_type, int subround) const;
         void arBarrierReached();
         void arDoTransition();
         EventFunctionWrapper barrierReleaseEvent;

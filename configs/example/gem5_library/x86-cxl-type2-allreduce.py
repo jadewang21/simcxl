@@ -63,7 +63,8 @@ parser.add_argument("--lsu-mode", type=int, default=9,
                     help="9: Baseline HBM-Centric; 10: Host-Centric CBC 2.0; "
                          "11: Mode 9 + COP Prefetch; 12: D2D Write + NC-P Push + Host AG Read; "
                          "13: CO-Write to Host + Host AG Read; "
-                         "14: CO-Write to own HBM via Ruby + distributed HBM Dir AG Read")
+                         "14: CO-Write to own HBM via Ruby + distributed HBM Dir AG Read; "
+                         "15: Half-Tree RS (2 rounds + MESI prefetch) + Ring AG")
 parser.add_argument("--lsu-num", type=int, default=2048,
                     help="Total cachelines in AllReduce buffer")
 parser.add_argument("--allreduce-rounds", type=int, default=4,
@@ -72,6 +73,8 @@ parser.add_argument("--num-npus", type=int, default=4,
                     help="Number of NPUs in ring (modes 7-10)")
 parser.add_argument("--compute-lat", type=str, default="40ns",
                     help="Compute latency per cache line for reduction (modes 9/10)")
+parser.add_argument("--barrier-lat", type=str, default="0ns",
+                    help="Per-barrier synchronization latency (0 = ideal)")
 parser.add_argument("--hbm-per-npu", type=str, default="256MiB",
                     help="HBM size per NPU (used when num-npus > 1)")
 parser.add_argument("--prefetch-ownership", action="store_true", default=False,
@@ -141,6 +144,7 @@ board = X86BoardCXLType2(
     num_npus=args.num_npus,
     compute_lat_per_line=args.compute_lat,
     prefetch_ownership=args.prefetch_ownership,
+    barrier_latency=args.barrier_lat,
 )
 
 command = (
@@ -167,6 +171,7 @@ simulator = Simulator(
 print(f"[AllReduce] mode={args.lsu_mode}, lsu_num={args.lsu_num}, "
       f"rounds={args.allreduce_rounds}, num_npus={args.num_npus}, "
       f"compute_lat={args.compute_lat}, "
+      f"barrier_lat={args.barrier_lat}, "
       f"hbm_per_npu={args.hbm_per_npu if args.num_npus > 1 else '8GB'}, "
       f"prefetch_ownership={args.prefetch_ownership}, "
       f"num_l2_banks={args.num_l2_banks}, "

@@ -76,6 +76,7 @@ CXLType2Accel::CXLType2Accel(const Params &p)
     computeLatPerLine(p.compute_lat_per_line),
     ar_rs_compute_total(0),
     computeDoneEvent([this]{ arComputeDone(); }, name()),
+    barrierLatency(p.barrier_latency),
     prefetchOwnership(p.prefetch_ownership),
     ar_prefetch_active(false),
     ar_prefetch_done(false),
@@ -86,6 +87,9 @@ CXLType2Accel::CXLType2Accel(const Params &p)
     pf_blocked_pkt(nullptr),
     pf_start_tick(0),
     pfNextEvent([this]{ issuePrefetchNext(); }, name()),
+    ar_concurrent_prefetch(false),
+    pf_ag_mode(false),
+    ag_pf_in_flight(false),
     barrierReleaseEvent([this]{ arDoTransition(); }, name()),
     accelStatus(Uninitialized),
     cxlRspPort(p.name + ".cxl_rsp_port", *this, memReqPort,
@@ -102,6 +106,10 @@ CXLType2Accel::CXLType2Accel(const Params &p)
         std::memset(ar_read_lat, 0, sizeof(ar_read_lat));
         std::memset(ar_write_lat, 0, sizeof(ar_write_lat));
         std::memset(dev_mem_bases, 0, sizeof(dev_mem_bases));
+        std::memset(rs_read_per_sub, 0, sizeof(rs_read_per_sub));
+        std::memset(rs_write_per_sub, 0, sizeof(rs_write_per_sub));
+        std::memset(ag_read_per_sub, 0, sizeof(ag_read_per_sub));
+        std::memset(ag_write_per_sub, 0, sizeof(ag_write_per_sub));
         for (int i = 0; i < MAX_DMC_SETS; i++) {
             dmc[i].valid = false;
             dmc[i].dirty = false;
@@ -124,7 +132,7 @@ CXLType2Accel::CXLType2Accel(const Params &p)
             DPRINTF(CXLType1Accel, "AllReduce mode=%d rounds=%d dev_mem_base=%#lx\n",
                     lsu_mode, allreduce_rounds, dev_mem_base);
         }
-        if (lsu_mode >= 7 && lsu_mode <= 14) {
+        if (lsu_mode >= 7 && lsu_mode <= 17) {
             DPRINTF(CXLType1Accel,
                     "RingAllReduce mode=%d npu_id=%d num_npus=%d lsu_num=%d "
                     "chunk_size=%d dev_mem_base=%#lx compute_lat=%llu\n",
@@ -244,7 +252,15 @@ CXLType2Accel::DcachePort::recvTimingResp(PacketPtr pkt)
 void
 CXLType2Accel::recvData(PacketPtr pkt)
 {
-    if (ar_prefetch_active) {
+    // Mode 15 concurrent prefetch: route by address, not by flag
+    if ((ar_concurrent_prefetch || ag_pf_in_flight) &&
+        pf_pending_addrs.count(pkt->getAddr())) {
+        pf_pending_addrs.erase(pkt->getAddr());
+        pfResponseReceived();
+        return;
+    }
+
+    if (ar_prefetch_active && !ar_concurrent_prefetch) {
         pfResponseReceived();
         return;
     }
@@ -264,7 +280,7 @@ CXLType2Accel::recvData(PacketPtr pkt)
     recv_num++;
     if (recv_num >= paddr.num) {
         DPRINTF(CXLType1Accel, "All LSU responses have been received!\n");
-        if (lsu_mode >= 5 && lsu_mode <= 14) {
+        if (lsu_mode >= 5 && lsu_mode <= 17) {
             arPhaseComplete();
         } else {
             LSUFinish();
@@ -297,12 +313,12 @@ CXLType2Accel::LSUFinish()
                 clockEdge() - first_issue_time);
     }
 
-    if (lsu_mode >= 7 && lsu_mode <= 14) {
+    if (lsu_mode >= 7 && lsu_mode <= 17) {
         stats.arRsReadLat = ar_rs_read_total;
         stats.arRsWriteLat = ar_rs_write_total;
         stats.arAgReadLat = ar_ag_read_total;
         stats.arAgWriteLat = ar_ag_write_total;
-        if (lsu_mode >= 9 && lsu_mode <= 14)
+        if (lsu_mode >= 9 && lsu_mode <= 17)
             stats.arRsComputeLat = ar_rs_compute_total;
         if (lsu_mode == 12)
             stats.arNcpPushLat = ar_ncp_push_total;
@@ -317,11 +333,38 @@ CXLType2Accel::LSUFinish()
                 ar_ncp_push_total, ar_ag_read_total, ar_ag_write_total,
                 (Tick)stats.arComputeReadLat.value(),
                 clockEdge() - first_issue_time);
+
+        int log2n = 0;
+        for (int tmp = num_npus; tmp > 1; tmp >>= 1) log2n++;
+        int rs_rounds;
+        if ((lsu_mode == 15 || lsu_mode == 16) && num_npus >= 4)
+            rs_rounds = 2;
+        else if (lsu_mode == 17 && num_npus >= 4)
+            rs_rounds = log2n;
+        else
+            rs_rounds = num_npus - 1;
+        for (int i = 0; i < rs_rounds && i < MAX_SUBROUNDS; i++) {
+            DPRINTF(CXLType1Accel,
+                    "[NPU%d]   RS sub[%d]: read=%llu write=%llu\n",
+                    npu_id, i, rs_read_per_sub[i], rs_write_per_sub[i]);
+        }
+        int ag_rounds;
+        if ((lsu_mode == 15 || lsu_mode == 16) && num_npus >= 4)
+            ag_rounds = 2;
+        else if (lsu_mode == 17 && num_npus >= 4)
+            ag_rounds = log2n;
+        else
+            ag_rounds = num_npus - 1;
+        for (int i = 0; i < ag_rounds && i < MAX_SUBROUNDS; i++) {
+            DPRINTF(CXLType1Accel,
+                    "[NPU%d]   AG sub[%d]: read=%llu write=%llu\n",
+                    npu_id, i, ag_read_per_sub[i], ag_write_per_sub[i]);
+        }
     }
 
     LSU_finished = 1;
 
-    if (lsu_mode >= 5 && lsu_mode <= 14) {
+    if (lsu_mode >= 5 && lsu_mode <= 17) {
         if (multiNpuMode()) {
             s_finished_count++;
             DPRINTF(CXLType1Accel,
@@ -343,25 +386,40 @@ CXLType2Accel::arPhaseComplete()
     Tick now = clockEdge();
     Tick phase_lat = now - ar_phase_start;
 
-    if (lsu_mode >= 7 && lsu_mode <= 14) {
+    if (lsu_mode >= 7 && lsu_mode <= 17) {
         const char *phase_names[] = {"RS", "AG", "Compute", "NcpPush"};
 
         if (ar_is_read_phase) {
-            if (ar_phase_type == 0)
+            if (ar_phase_type == 0) {
                 ar_rs_read_total += phase_lat;
-            else if (ar_phase_type == 1)
+                if (ar_subround < MAX_SUBROUNDS)
+                    rs_read_per_sub[ar_subround] = phase_lat;
+            } else if (ar_phase_type == 1) {
                 ar_ag_read_total += phase_lat;
+                if (ar_subround < MAX_SUBROUNDS)
+                    ag_read_per_sub[ar_subround] = phase_lat;
+            }
 
             DPRINTF(CXLType1Accel,
                     "[NPU%d] Ring %s subround %d read done: %llu ticks\n",
                     npu_id, phase_names[ar_phase_type], ar_subround,
                     phase_lat);
+
+            // Mode 15 concurrent prefetch: don't wait here.
+            // Compute has no dependency on prefetch data (it's for the
+            // next XOR step), so proceed to barrier+compute immediately.
+            // The prefetch will keep running in the background and we
+            // check completion after compute in arComputeDone().
         } else {
-            if (ar_phase_type == 0)
+            if (ar_phase_type == 0) {
                 ar_rs_write_total += phase_lat;
-            else if (ar_phase_type == 1)
+                if (ar_subround < MAX_SUBROUNDS)
+                    rs_write_per_sub[ar_subround] = phase_lat;
+            } else if (ar_phase_type == 1) {
                 ar_ag_write_total += phase_lat;
-            else if (ar_phase_type == 3)
+                if (ar_subround < MAX_SUBROUNDS)
+                    ag_write_per_sub[ar_subround] = phase_lat;
+            } else if (ar_phase_type == 3)
                 ar_ncp_push_total += phase_lat;
 
             DPRINTF(CXLType1Accel,
@@ -406,12 +464,20 @@ CXLType2Accel::arStartPhase(bool is_read)
     cur_num = 0;
     recv_num = 0;
 
-    if (lsu_mode >= 7 && lsu_mode <= 14) {
+    if (lsu_mode >= 7 && lsu_mode <= 17) {
         if (ar_phase_type == 2)
             paddr.num = lsu_num;
         else if (ar_phase_type == 3)
             paddr.num = (num_npus - 1) * chunk_size;
-        else
+        else if ((lsu_mode == 15 || lsu_mode == 16) && num_npus >= 4 &&
+                 ar_phase_type == 1 && ar_subround == 1)
+            paddr.num = 2 * chunk_size;
+        else if (lsu_mode == 16 && num_npus >= 4 && ar_phase_type == 0) {
+            paddr.num = (ar_subround == 0) ? 2 * chunk_size : chunk_size;
+        } else if (lsu_mode == 17 && num_npus >= 4) {
+            paddr.num = tree17IsActive(ar_phase_type, ar_subround)
+                        ? lsu_num : 0;
+        } else
             paddr.num = chunk_size;
         const char *phase_names[] = {"RS", "AG", "Compute", "NcpPush"};
         DPRINTF(CXLType1Accel,
@@ -423,6 +489,10 @@ CXLType2Accel::arStartPhase(bool is_read)
         DPRINTF(CXLType1Accel,
                 "AR starting round %d %s phase (%d requests)\n",
                 ar_round, is_read ? "READ" : "WRITE", lsu_num);
+    }
+    if (paddr.num == 0) {
+        arPhaseComplete();
+        return;
     }
     stage1();
 }
@@ -490,7 +560,7 @@ CXLType2Accel::d2dResponseComplete()
     recv_num++;
     if (recv_num >= paddr.num) {
         DPRINTF(CXLType1Accel, "All D2D responses received!\n");
-        if (lsu_mode >= 5 && lsu_mode <= 14) {
+        if (lsu_mode >= 5 && lsu_mode <= 17) {
             arPhaseComplete();
         } else {
             LSUFinish();
@@ -505,6 +575,21 @@ CXLType2Accel::arComputeDone()
             "[NPU%d] RS subround %d compute done\n",
             npu_id, ar_subround);
     ar_compute_done = true;
+
+    // Mode 15: prefetch was launched with RS1 read and may still be running.
+    // Now that compute is done, check if it has finished.
+    if (ar_concurrent_prefetch && !ar_prefetch_done) {
+        ar_waiting_for_prefetch = true;
+        DPRINTF(CXLType1Accel,
+                "[NPU%d] compute done, waiting for Mode 15 "
+                "concurrent prefetch to finish\n", npu_id);
+        return;
+    }
+    if (ar_concurrent_prefetch) {
+        ar_concurrent_prefetch = false;
+        pf_pending_addrs.clear();
+    }
+
     if ((lsu_mode == 11 || lsu_mode == 13 || lsu_mode == 14) &&
         ar_prefetch_active) {
         ar_waiting_for_prefetch = true;
@@ -525,6 +610,7 @@ CXLType2Accel::startOwnershipPrefetch()
 {
     ar_prefetch_active = true;
     ar_prefetch_done = false;
+    pf_ag_mode = false;
     pf_cur_num = 0;
     pf_recv_num = 0;
     pf_total = (ar_phase_type == 2) ? lsu_num : chunk_size;
@@ -537,13 +623,42 @@ CXLType2Accel::startOwnershipPrefetch()
 }
 
 void
+CXLType2Accel::startAgPrefetch()
+{
+    ar_prefetch_active = true;
+    ar_prefetch_done = false;
+    pf_ag_mode = true;
+    pf_cur_num = 0;
+    pf_recv_num = 0;
+    pf_total = 2 * chunk_size;
+    pf_start_tick = curTick();
+    DPRINTF(CXLType1Accel,
+            "[NPU%d] starting AG Step1 prefetch for %d lines "
+            "(holder1=NPU%d, holder2=NPU%d)\n",
+            npu_id, pf_total, npu_id ^ 2, npu_id ^ 3);
+    issuePrefetchNext();
+}
+
+void
 CXLType2Accel::issuePrefetchNext()
 {
     if (pf_cur_num >= pf_total)
         return;
 
     Addr addr;
-    if (lsu_mode == 11) {
+    if (lsu_mode == 15 && pf_ag_mode) {
+        int holder1 = npu_id ^ 2;
+        int holder2 = npu_id ^ 3;
+        if (pf_cur_num < chunk_size)
+            addr = dev_mem_bases[holder1] +
+                   (chunk_size + pf_cur_num) * cacheLineSize;
+        else
+            addr = dev_mem_bases[holder2] +
+                   (chunk_size + (pf_cur_num - chunk_size)) * cacheLineSize;
+    } else if (lsu_mode == 15) {
+        int cross_src = (npu_id + num_npus / 2) % num_npus;
+        addr = dev_mem_bases[cross_src] + pf_cur_num * cacheLineSize;
+    } else if (lsu_mode == 11) {
         int src = (npu_id - 1 + num_npus) % num_npus;
         int co = ar_subround * chunk_size;
         addr = dev_mem_bases[src] + (co + pf_cur_num) * cacheLineSize;
@@ -573,10 +688,15 @@ CXLType2Accel::issuePrefetchNext()
         pkt->dataDynamic<uint8_t>(new uint8_t[cacheLineSize]);
     }
 
+    if (ar_concurrent_prefetch || ag_pf_in_flight)
+        pf_pending_addrs.insert(addr);
+
     if (!dcachePort.sendTimingReq(pkt)) {
         DPRINTF(CXLType1Accel,
                 "[NPU%d] prefetch blocked at idx %d, addr %#x\n",
                 npu_id, pf_cur_num, addr);
+        if (ar_concurrent_prefetch || ag_pf_in_flight)
+            pf_pending_addrs.erase(addr);
         pf_blocked_pkt = pkt;
     } else {
         DPRINTF(CXLType1Accel,
@@ -604,9 +724,25 @@ CXLType2Accel::pfResponseReceived()
         DPRINTF(CXLType1Accel,
                 "[NPU%d] all prefetches done (%llu ticks)\n",
                 npu_id, curTick() - pf_start_tick);
+        if (ag_pf_in_flight) {
+            ag_pf_in_flight = false;
+            pf_pending_addrs.clear();
+            DPRINTF(CXLType1Accel,
+                    "[NPU%d] AG Step1 prefetch complete (background)\n",
+                    npu_id);
+            return;
+        }
         if (ar_waiting_for_prefetch) {
             ar_waiting_for_prefetch = false;
-            if (lsu_mode == 11 || lsu_mode == 13 || lsu_mode == 14) {
+            if (ar_concurrent_prefetch) {
+                ar_concurrent_prefetch = false;
+                pf_pending_addrs.clear();
+                if (multiNpuMode())
+                    arBarrierReached();
+                else
+                    arDoTransition();
+            } else if (lsu_mode == 11 || lsu_mode == 13 ||
+                       lsu_mode == 14) {
                 if (multiNpuMode())
                     arBarrierReached();
                 else
@@ -616,6 +752,30 @@ CXLType2Accel::pfResponseReceived()
             }
         }
     }
+}
+
+bool
+CXLType2Accel::tree17IsActive(int phase_type, int subround) const
+{
+    if (phase_type == 2) return true;  // ComputeRead: all active
+    if (phase_type == 0) {
+        // Tree Reduce step k: distance = 1 << k.
+        // Active readers = NPUs whose ID is a multiple of (2 * distance),
+        // i.e. parent of the pair. Child = parent + distance.
+        int dist = 1 << subround;
+        if ((npu_id % (2 * dist)) != 0) return false;
+        int child = npu_id + dist;
+        return child < num_npus;
+    }
+    // Tree Broadcast: reverse of reduce.
+    // Step 0: dist = num_npus/2, Step 1: dist = num_npus/4, ...
+    int dist = num_npus / 2;
+    for (int s = 0; s < subround; s++) dist >>= 1;
+    // Active readers = NPUs that receive: npu_id = parent + dist,
+    // where parent % (2*dist) == 0.
+    int parent = npu_id - dist;
+    if (parent < 0) return false;
+    return (parent % (2 * dist)) == 0;
 }
 
 void
@@ -628,9 +788,11 @@ CXLType2Accel::arBarrierReached()
 
     if (s_barrier_count >= (int)s_all_npus.size()) {
         s_barrier_count = 0;
+        Tick release_tick = curTick() + barrierLatency;
         for (auto *npu : s_all_npus) {
+            Tick t = std::max(release_tick, npu->clockEdge());
             if (!npu->barrierReleaseEvent.scheduled())
-                npu->schedule(npu->barrierReleaseEvent, npu->clockEdge());
+                npu->schedule(npu->barrierReleaseEvent, t);
         }
     }
 }
@@ -643,10 +805,11 @@ CXLType2Accel::arDoTransition()
             Tick phase_lat = clockEdge() - ar_phase_start;
             stats.arComputeReadLat = phase_lat;
             LSUFinish();
-        } else if ((lsu_mode >= 9 && lsu_mode <= 14) &&
+        } else if ((lsu_mode >= 9 && lsu_mode <= 17) &&
                    ar_phase_type == 0 && computeLatPerLine > 0 &&
                    !ar_compute_done) {
-            Tick delay = (Tick)chunk_size * computeLatPerLine;
+            int compute_lines = (lsu_mode == 17) ? lsu_num : chunk_size;
+            Tick delay = (Tick)compute_lines * computeLatPerLine;
             ar_rs_compute_total += delay;
             DPRINTF(CXLType1Accel,
                     "[NPU%d] RS subround %d compute delay: %llu ticks\n",
@@ -659,6 +822,9 @@ CXLType2Accel::arDoTransition()
                 multiNpuMode()) {
                 startOwnershipPrefetch();
             }
+            // Mode 15: prefetch was already launched concurrently with
+            // the RS1 Read and continues running in background.  Compute
+            // overlaps with it; completion is checked in arComputeDone().
         } else {
             ar_compute_done = false;
             if (prefetchOwnership && lsu_mode == 10 &&
@@ -675,7 +841,16 @@ CXLType2Accel::arDoTransition()
         }
     } else {
         ar_subround++;
-        if (ar_phase_type == 0 && ar_subround >= num_npus - 1) {
+        int log2n = 0;
+        for (int tmp = num_npus; tmp > 1; tmp >>= 1) log2n++;
+        int rs_rounds;
+        if ((lsu_mode == 15 || lsu_mode == 16) && num_npus >= 4)
+            rs_rounds = 2;
+        else if (lsu_mode == 17 && num_npus >= 4)
+            rs_rounds = log2n;
+        else
+            rs_rounds = num_npus - 1;
+        if (ar_phase_type == 0 && ar_subround >= rs_rounds) {
             if (lsu_mode == 12) {
                 ar_phase_type = 3;
                 ar_subround = 0;
@@ -689,6 +864,14 @@ CXLType2Accel::arDoTransition()
                 DPRINTF(CXLType1Accel,
                         "[NPU%d] RS complete, switching to AG\n",
                         npu_id);
+                if (lsu_mode == 15 && num_npus >= 4) {
+                    ag_pf_in_flight = true;
+                    ar_prefetch_done = false;
+                    DPRINTF(CXLType1Accel,
+                            "[NPU%d] Mode15: launching AG Step1 prefetch "
+                            "concurrent with AG Step0\n", npu_id);
+                    startAgPrefetch();
+                }
                 arStartPhase(true);
             }
         } else if (ar_phase_type == 3) {
@@ -698,14 +881,34 @@ CXLType2Accel::arDoTransition()
                     "[NPU%d] NC-P Push complete, switching to AG\n",
                     npu_id);
             arStartPhase(true);
-        } else if (ar_phase_type == 1 && ar_subround >= num_npus - 1) {
-            ar_phase_type = 2;
-            ar_subround = 0;
-            DPRINTF(CXLType1Accel,
-                    "[NPU%d] AG complete, switching to ComputeRead\n",
-                    npu_id);
-            arStartPhase(true);
+        } else if (ar_phase_type == 1) {
+            int ag_rounds;
+            if ((lsu_mode == 15 || lsu_mode == 16) && num_npus >= 4)
+                ag_rounds = 2;
+            else if (lsu_mode == 17 && num_npus >= 4)
+                ag_rounds = log2n;
+            else
+                ag_rounds = num_npus - 1;
+            if (ar_subround >= ag_rounds) {
+                ar_phase_type = 2;
+                ar_subround = 0;
+                DPRINTF(CXLType1Accel,
+                        "[NPU%d] AG complete, switching to ComputeRead\n",
+                        npu_id);
+                arStartPhase(true);
+            } else {
+                arStartPhase(true);
+            }
         } else {
+            if (lsu_mode == 15 && num_npus >= 4 &&
+                ar_phase_type == 0 && ar_subround == 1) {
+                ar_concurrent_prefetch = true;
+                ar_prefetch_done = false;
+                DPRINTF(CXLType1Accel,
+                        "[NPU%d] Mode15: launching concurrent prefetch "
+                        "with RS1 Read\n", npu_id);
+                startOwnershipPrefetch();
+            }
             arStartPhase(true);
         }
     }
@@ -798,7 +1001,9 @@ CXLType2Accel::sendDataD2D(PacketPtr pkt, bool read)
 void
 CXLType2Accel::DcachePort::recvReqRetry()
 {
-    if (device->ar_prefetch_active && device->pf_blocked_pkt) {
+    if ((device->ar_prefetch_active || device->ar_concurrent_prefetch
+         || device->ag_pf_in_flight)
+        && device->pf_blocked_pkt) {
         PacketPtr tmp = device->pf_blocked_pkt;
         if (sendTimingReq(tmp)) {
             DPRINTF(CXLType1Accel,
@@ -1084,6 +1289,183 @@ CXLType2Accel::getPhyAddr(int index)
             }
             break;
         }
+        case 15: {
+            // Mode 15: Half-Tree AllReduce
+            // RS: 2 subrounds (not N-1). RS0 = standard ring step.
+            // During RS0 compute, prefetch cross-group NPU's RS0 result.
+            // RS1 reads different original chunk from predecessor + HMC hit
+            // for prefetched data.  AG: standard ring (unchanged).
+            int co = ar_subround * chunk_size;
+            int num = (ar_phase_type == 2) ? lsu_num : chunk_size;
+            int idx = index % num;
+
+            if (ar_phase_type == 0) {          // Reduce-Scatter
+                if (ar_is_read_phase) {
+                    if (multiNpuMode() && ar_subround == 0) {
+                        // RS0: read predecessor's chunk (same as ring RS1)
+                        int src = (npu_id - 1 + num_npus) % num_npus;
+                        phy_addr = dev_mem_bases[src] +
+                                   idx * cacheLineSize;
+                    } else if (multiNpuMode() && ar_subround == 1) {
+                        // RS1: read predecessor's ORIGINAL data for a
+                        // different chunk.  In the half-tree topology for
+                        // 4 NPUs, NPU_i needs original chunk data from
+                        // predecessor at offset chunk_size.
+                        int src = (npu_id - 1 + num_npus) % num_npus;
+                        phy_addr = dev_mem_bases[src] +
+                                   (chunk_size + idx) * cacheLineSize;
+                    } else {
+                        phy_addr = paddr.phy + (co + idx) * cacheLineSize;
+                    }
+                } else {
+                    phy_addr = dev_mem_base + (co + idx) * cacheLineSize;
+                }
+            } else if (ar_phase_type == 1) {   // AllGather (recursive doubling)
+                if (ar_is_read_phase) {
+                    if (multiNpuMode() && num_npus >= 4) {
+                        if (ar_subround == 0) {
+                            int src = npu_id ^ 1;
+                            phy_addr = dev_mem_bases[src] +
+                                       (chunk_size + idx) * cacheLineSize;
+                        } else {
+                            int holder1 = npu_id ^ 2;
+                            int holder2 = npu_id ^ 3;
+                            if (idx < chunk_size)
+                                phy_addr = dev_mem_bases[holder1] +
+                                           (chunk_size + idx) * cacheLineSize;
+                            else
+                                phy_addr = dev_mem_bases[holder2] +
+                                           (chunk_size + (idx - chunk_size)) *
+                                           cacheLineSize;
+                        }
+                    } else if (multiNpuMode()) {
+                        int src = (npu_id - 1 + num_npus) % num_npus;
+                        phy_addr = dev_mem_bases[src] +
+                                   (co + idx) * cacheLineSize;
+                    } else {
+                        phy_addr = paddr.phy +
+                                   (2 * lsu_num + co + idx) * cacheLineSize;
+                    }
+                } else {
+                    if (multiNpuMode() && num_npus >= 4) {
+                        if (ar_subround == 0)
+                            phy_addr = dev_mem_base +
+                                       (lsu_num + idx) * cacheLineSize;
+                        else
+                            phy_addr = dev_mem_base +
+                                       (lsu_num + chunk_size + idx) *
+                                       cacheLineSize;
+                    } else {
+                        phy_addr = dev_mem_base +
+                                   (lsu_num + co + idx) * cacheLineSize;
+                    }
+                }
+            } else {                           // Compute Read
+                phy_addr = dev_mem_base + idx * cacheLineSize;
+            }
+            break;
+        }
+        case 16: {
+            // Mode 16: Textbook Rabenseifner (RH RS + RD AG), no CXL prefetch
+            // RS: distance N/2 then N/4; AG: distance 1 then 2
+            int idx = index % paddr.num;
+
+            if (ar_phase_type == 0) {          // Reduce-Scatter
+                if (ar_is_read_phase) {
+                    if (ar_subround == 0) {
+                        // RS Step 0: XOR distance N/2, read 2*chunk_size
+                        int partner = npu_id ^ (num_npus / 2);
+                        int range_start = (npu_id & (num_npus / 2))
+                                          ? (2 * chunk_size) : 0;
+                        phy_addr = dev_mem_bases[partner] +
+                                   (range_start + idx) * cacheLineSize;
+                    } else {
+                        // RS Step 1: XOR distance 1, read chunk_size
+                        int partner = npu_id ^ 1;
+                        int chunk_start = npu_id * chunk_size;
+                        phy_addr = dev_mem_bases[partner] +
+                                   (chunk_start + idx) * cacheLineSize;
+                    }
+                } else {
+                    if (ar_subround == 0) {
+                        int range_start = (npu_id & (num_npus / 2))
+                                          ? (2 * chunk_size) : 0;
+                        phy_addr = dev_mem_base +
+                                   (range_start + idx) * cacheLineSize;
+                    } else {
+                        int chunk_start = npu_id * chunk_size;
+                        phy_addr = dev_mem_base +
+                                   (chunk_start + idx) * cacheLineSize;
+                    }
+                }
+            } else if (ar_phase_type == 1) {   // AllGather (recursive doubling)
+                if (ar_is_read_phase) {
+                    if (ar_subround == 0) {
+                        // AG Step 0: XOR distance 1, read chunk_size
+                        int partner = npu_id ^ 1;
+                        int partner_chunk = partner * chunk_size;
+                        phy_addr = dev_mem_bases[partner] +
+                                   (partner_chunk + idx) * cacheLineSize;
+                    } else {
+                        // AG Step 1: XOR distance N/2, read 2*chunk_size
+                        // Read from original RS holders
+                        int partner_base = npu_id ^ (num_npus / 2);
+                        int holder = partner_base ^ (idx >= chunk_size ? 1 : 0);
+                        int local_idx = idx % chunk_size;
+                        int holder_chunk = holder * chunk_size;
+                        phy_addr = dev_mem_bases[holder] +
+                                   (holder_chunk + local_idx) * cacheLineSize;
+                    }
+                } else {
+                    if (ar_subround == 0)
+                        phy_addr = dev_mem_base +
+                                   (lsu_num + idx) * cacheLineSize;
+                    else
+                        phy_addr = dev_mem_base +
+                                   (lsu_num + chunk_size + idx) * cacheLineSize;
+                }
+            } else {                           // Compute Read
+                phy_addr = dev_mem_base + idx * cacheLineSize;
+            }
+            break;
+        }
+        case 17: {
+            // Mode 17: Binary Tree Reduce + Broadcast
+            // Reduce: log2(N) steps, each active reader reads lsu_num lines
+            // Broadcast: log2(N) steps (reverse tree)
+            int idx = index % paddr.num;
+
+            if (ar_phase_type == 0) {          // Tree Reduce
+                if (ar_is_read_phase) {
+                    // Step k: distance = 1 << k. Parent = lower ID in pair.
+                    int dist = 1 << ar_subround;
+                    int child = npu_id + dist;
+                    phy_addr = dev_mem_bases[child] + idx * cacheLineSize;
+                } else {
+                    phy_addr = dev_mem_base + idx * cacheLineSize;
+                }
+            } else if (ar_phase_type == 1) {   // Tree Broadcast
+                if (ar_is_read_phase) {
+                    int total_steps = 0;
+                    for (int d = num_npus / 2; d >= 1; d >>= 1) total_steps++;
+                    int bcast_step = ar_subround;
+                    int dist = num_npus / 2;
+                    for (int s = 0; s < bcast_step; s++) dist >>= 1;
+                    int parent = npu_id - dist;
+                    if (bcast_step == 0)
+                        phy_addr = dev_mem_bases[parent] + idx * cacheLineSize;
+                    else
+                        phy_addr = dev_mem_bases[parent] +
+                                   (lsu_num + idx) * cacheLineSize;
+                } else {
+                    phy_addr = dev_mem_base +
+                               (lsu_num + idx) * cacheLineSize;
+                }
+            } else {                           // Compute Read
+                phy_addr = dev_mem_base + idx * cacheLineSize;
+            }
+            break;
+        }
         case 14: // Mode 14: CO-Write to own HBM via Ruby + AG from predecessor HBM
         case 11: // Mode 11: same addressing as Mode 9 + prefetch during compute
         case 9: {
@@ -1233,7 +1615,7 @@ CXLType2Accel::runLSU()
         first_issue_time = clockEdge();
     }
 
-    if (lsu_mode >= 7 && lsu_mode <= 14) {
+    if (lsu_mode >= 7 && lsu_mode <= 17) {
         // Populate dev_mem_bases from all registered NPUs
         for (auto *npu : s_all_npus)
             dev_mem_bases[npu->npu_id] = npu->dev_mem_base;
@@ -1258,6 +1640,18 @@ CXLType2Accel::runLSU()
                     npu->ar_ag_write_total = 0;
                     npu->ar_rs_compute_total = 0;
                     npu->ar_ncp_push_total = 0;
+                    std::memset(npu->rs_read_per_sub, 0,
+                                sizeof(npu->rs_read_per_sub));
+                    std::memset(npu->rs_write_per_sub, 0,
+                                sizeof(npu->rs_write_per_sub));
+                    std::memset(npu->ag_read_per_sub, 0,
+                                sizeof(npu->ag_read_per_sub));
+                    std::memset(npu->ag_write_per_sub, 0,
+                                sizeof(npu->ag_write_per_sub));
+                    npu->ar_concurrent_prefetch = false;
+                    npu->pf_ag_mode = false;
+                    npu->ag_pf_in_flight = false;
+                    npu->pf_pending_addrs.clear();
                     npu->ar_compute_done = false;
                     npu->ar_total_start = clockEdge();
                     DPRINTF(CXLType1Accel,
@@ -1276,6 +1670,14 @@ CXLType2Accel::runLSU()
         ar_ag_write_total = 0;
         ar_rs_compute_total = 0;
         ar_ncp_push_total = 0;
+        std::memset(rs_read_per_sub, 0, sizeof(rs_read_per_sub));
+        std::memset(rs_write_per_sub, 0, sizeof(rs_write_per_sub));
+        std::memset(ag_read_per_sub, 0, sizeof(ag_read_per_sub));
+        std::memset(ag_write_per_sub, 0, sizeof(ag_write_per_sub));
+        ar_concurrent_prefetch = false;
+        pf_ag_mode = false;
+        ag_pf_in_flight = false;
+        pf_pending_addrs.clear();
         ar_total_start = clockEdge();
         arStartPhase(true);
     } else if (lsu_mode == 5 || lsu_mode == 6) {
@@ -1301,7 +1703,7 @@ CXLType2Accel::stage2()
 {
     stage = 2;
     bool is_read;
-    if (lsu_mode >= 5 && lsu_mode <= 14)
+    if (lsu_mode >= 5 && lsu_mode <= 17)
         is_read = ar_is_read_phase;
     else
         is_read = (load_store == 1);

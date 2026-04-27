@@ -240,23 +240,32 @@ class CXLMESITwoLevelCacheHierarchy(
                            + self._directory_controllers
                            + self._dma_controllers)
 
-        hbm_dir_indices = set()
-        if self._cxl_link_latency > 1:
-            num_host_dirs = len(board.get_mem_ports())
-            base = len(self._l1_controllers) + len(self._l2_controllers)
-            for i in range(num_host_dirs, len(self._directory_controllers)):
-                hbm_dir_indices.add(base + i)
+        # CXL ext_link indices: both CXL hops should be modeled.
+        #   Hop-1: NPU HMC L1 <-> Host Root Complex (device-side ext_link)
+        #   Hop-2: Host Root Complex <-> peer NPU HBM Directory (peer-side ext_link)
+        # Previously only Hop-2 was modeled, which under-counted CXL latency for
+        # NPU->Host DDR/LLC paths and skipped CXL bandwidth throttling on the
+        # device-side link for those flows.  We now attach cxl_link_latency and
+        # the CXL bandwidth factor to both hops so the two CXL traversals are
+        # symmetric and the per-link bandwidth limit is actually enforced.
+        cxl_ext_indices = set()
+        # Hop-1: device-side ext_link of every NPU HMC L1 controller
+        for i in range(num_cpu_l1_controllers, len(self._l1_controllers)):
+            cxl_ext_indices.add(i)
+        # Hop-2: peer-side ext_link of every HBM Directory controller
+        num_host_dirs = len(board.get_mem_ports())
+        base = len(self._l1_controllers) + len(self._l2_controllers)
+        for i in range(num_host_dirs, len(self._directory_controllers)):
+            cxl_ext_indices.add(base + i)
 
         controller_bandwidth_factors = {}
         if self._cxl_link_bandwidth_factor:
-            for i in range(num_cpu_l1_controllers, len(self._l1_controllers)):
-                controller_bandwidth_factors[i] = self._cxl_link_bandwidth_factor
-            for i in hbm_dir_indices:
+            for i in cxl_ext_indices:
                 controller_bandwidth_factors[i] = self._cxl_link_bandwidth_factor
 
         self.ruby_system.network.connectControllers(
             all_controllers,
-            cxl_node_indices=hbm_dir_indices if hbm_dir_indices else None,
+            cxl_node_indices=cxl_ext_indices if cxl_ext_indices else None,
             cxl_link_latency=self._cxl_link_latency,
             controller_bandwidth_factors=(
                 controller_bandwidth_factors
