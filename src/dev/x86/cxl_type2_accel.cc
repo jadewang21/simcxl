@@ -263,7 +263,7 @@ CXLType2Accel::recvData(PacketPtr pkt)
         return;
     }
 
-    if (ar_prefetch_active && !ar_concurrent_prefetch) {
+    if (ar_prefetch_active && !ar_concurrent_prefetch && !ag_pf_in_flight) {
         pfResponseReceived();
         return;
     }
@@ -1008,7 +1008,12 @@ CXLType2Accel::DcachePort::recvReqRetry()
          || device->ag_pf_in_flight)
         && device->pf_blocked_pkt) {
         PacketPtr tmp = device->pf_blocked_pkt;
-        if (sendTimingReq(tmp)) {
+        if (!sendTimingReq(tmp))
+            return;
+
+        {
+            if (device->ar_concurrent_prefetch || device->ag_pf_in_flight)
+                device->pf_pending_addrs.insert(tmp->getAddr());
             DPRINTF(CXLType1Accel,
                     "[NPU%d] prefetch retry succeeded idx %d\n",
                     device->npu_id, device->pf_cur_num);
@@ -1019,7 +1024,12 @@ CXLType2Accel::DcachePort::recvReqRetry()
                     device->schedule(device->pfNextEvent, device->nextCycle());
             }
         }
-        return;
+
+        // A prefetch retry can consume the port retry callback while a normal
+        // LSU packet is also waiting.  Try the normal retry now so the main
+        // state machine cannot be starved behind a long prefetch stream.
+        if (!device->dcache_pkt || device->status != DcacheRetry)
+            return;
     }
     // we shouldn't get a retry unless we have a packet that we're
     // waiting to transmit
@@ -1299,7 +1309,7 @@ CXLType2Accel::getPhyAddr(int index)
             // RS1 reads different original chunk from predecessor + HMC hit
             // for prefetched data.  AG: standard ring (unchanged).
             int co = ar_subround * chunk_size;
-            int num = (ar_phase_type == 2) ? lsu_num : chunk_size;
+            int num = paddr.num;
             int idx = index % num;
 
             if (ar_phase_type == 0) {          // Reduce-Scatter
