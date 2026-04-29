@@ -116,6 +116,8 @@ class CXLType2Accel(PciDevice):
     compute_lat_per_line = Param.Latency("40ns", "Compute latency per cache line for reduction (400MHz FPGA, 2x FP16 adder)")
     prefetch_ownership = Param.Bool(False, "Enable prefetch-for-ownership: overlap GETX with RS Compute (Mode 10)")
     barrier_latency = Param.Latency("0ns", "Per-barrier synchronization latency (0 = ideal)")
+    dump_hbm_path = Param.String("", "Directory for raw HBM correctness dumps")
+    allreduce_input_seed = Param.Unsigned(1, "Deterministic seed for AllReduce correctness input initialization")
 
     VendorID = 0x8086
     DeviceID = 0X7890
@@ -151,7 +153,8 @@ class CXLType2Accel(PciDevice):
     def configCXL(self, proc_lat, queue_size, lsu_mode, lsu_num, load_store,
                   allreduce_rounds=4, num_npus=4, compute_lat_per_line="40ns",
                   npu_id=0, prefetch_ownership=False,
-                  barrier_latency="0ns"):
+                  barrier_latency="0ns", dump_hbm_path="",
+                  allreduce_input_seed=1):
         self.proto_proc_lat = proc_lat
         self.rsp_size = queue_size
         self.req_size = queue_size
@@ -164,3 +167,5 @@ class CXLType2Accel(PciDevice):
         self.compute_lat_per_line = compute_lat_per_line
         self.prefetch_ownership = prefetch_ownership
         self.barrier_latency = barrier_latency
+        self.dump_hbm_path = dump_hbm_path
+        self.allreduce_input_seed = allreduce_input_seed

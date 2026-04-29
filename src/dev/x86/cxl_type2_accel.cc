@@ -1,4 +1,5 @@
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #include <random>
 
@@ -78,6 +79,9 @@ CXLType2Accel::CXLType2Accel(const Params &p)
     ar_rs_compute_total(0),
     computeDoneEvent([this]{ arComputeDone(); }, name()),
     barrierLatency(p.barrier_latency),
+    dumpHbmPath(p.dump_hbm_path),
+    allreduceInputSeed(p.allreduce_input_seed),
+    allreduceInputInitialized(false),
     prefetchOwnership(p.prefetch_ownership),
     disable_rs_pf(std::getenv("CXLRH_DISABLE_RS_PREFETCH") != nullptr),
     disable_ag_pf(std::getenv("CXLRH_DISABLE_AG_PREFETCH") != nullptr),
@@ -365,6 +369,8 @@ CXLType2Accel::LSUFinish()
         }
     }
 
+    dumpHbmIfRequested();
+
     LSU_finished = 1;
 
     if (lsu_mode >= 5 && lsu_mode <= 17) {
@@ -381,6 +387,85 @@ CXLType2Accel::LSUFinish()
                         curTick() + 1000);
         }
     }
+}
+
+bool
+CXLType2Accel::readHbmLineFunctional(Addr addr, uint8_t *buf)
+{
+    RequestPtr req = std::make_shared<Request>(addr, cacheLineSize, 0, 0);
+    PacketPtr pkt = Packet::createRead(req);
+    pkt->dataStatic(buf);
+    devMemPort.sendFunctional(pkt);
+    delete pkt;
+    return true;
+}
+
+void
+CXLType2Accel::writeHbmLineFunctional(Addr addr, const uint8_t *buf)
+{
+    RequestPtr req = std::make_shared<Request>(addr, cacheLineSize, 0, 0);
+    PacketPtr pkt = Packet::createWrite(req);
+    pkt->dataStatic(const_cast<uint8_t *>(buf));
+    devMemPort.sendFunctional(pkt);
+    delete pkt;
+}
+
+void
+CXLType2Accel::fillAllReduceInputLine(uint8_t *buf, int line) const
+{
+    uint32_t *lanes = reinterpret_cast<uint32_t *>(buf);
+    int lanes_per_line = cacheLineSize / sizeof(uint32_t);
+    for (int lane = 0; lane < lanes_per_line; lane++) {
+        lanes[lane] = (uint32_t)allreduceInputSeed +
+                      ((uint32_t)npu_id << 20) +
+                      (uint32_t)(line * lanes_per_line + lane);
+    }
+}
+
+void
+CXLType2Accel::initAllReduceInputIfNeeded()
+{
+    if (allreduceInputInitialized || lsu_mode < 7 || lsu_mode > 17)
+        return;
+
+    uint8_t buf[64];
+    for (int line = 0; line < lsu_num; line++) {
+        fillAllReduceInputLine(buf, line);
+        writeHbmLineFunctional(dev_mem_base + line * cacheLineSize, buf);
+    }
+    allreduceInputInitialized = true;
+    DPRINTF(CXLType1Accel,
+            "[NPU%d] initialized %d AllReduce input HBM lines seed=%llu\n",
+            npu_id, lsu_num, (unsigned long long)allreduceInputSeed);
+}
+
+void
+CXLType2Accel::dumpHbmIfRequested()
+{
+    if (dumpHbmPath.empty())
+        return;
+
+    char path[1024];
+    std::snprintf(path, sizeof(path), "%s/dump_npu%d.bin",
+                  dumpHbmPath.c_str(), npu_id);
+
+    FILE *fp = std::fopen(path, "wb");
+    if (!fp) {
+        DPRINTF(CXLType1Accel,
+                "[NPU%d] failed to open HBM dump path %s\n", npu_id, path);
+        return;
+    }
+
+    uint8_t buf[64];
+    for (int line = 0; line < lsu_num; line++) {
+        Addr addr = dev_mem_base + line * cacheLineSize;
+        readHbmLineFunctional(addr, buf);
+        std::fwrite(buf, 1, cacheLineSize, fp);
+    }
+    std::fclose(fp);
+
+    DPRINTF(CXLType1Accel,
+            "[NPU%d] dumped %d HBM lines to %s\n", npu_id, lsu_num, path);
 }
 
 void
@@ -1635,6 +1720,8 @@ CXLType2Accel::runLSU()
 
         // NPU0 triggers all peer NPUs in multi-NPU mode
         if (multiNpuMode() && npu_id == 0) {
+            for (auto *npu : s_all_npus)
+                npu->initAllReduceInputIfNeeded();
             s_barrier_count = 0;
             s_finished_count = 0;
             for (auto *npu : s_all_npus) {
@@ -1673,6 +1760,9 @@ CXLType2Accel::runLSU()
                 }
             }
         }
+
+        if (!multiNpuMode())
+            initAllReduceInputIfNeeded();
 
         ar_phase_type = 0;
         ar_subround = 0;

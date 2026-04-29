@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import os
 import re
 
 from gem5.utils.requires import requires
@@ -87,7 +88,14 @@ parser.add_argument("--cxl-link-latency", type=int, default=120,
 parser.add_argument("--cxl-link-bandwidth", type=float, default=0.0,
                     help="Effective single-direction CXL link bandwidth in "
                          "GB/s. 0 disables CXL bandwidth throttling.")
+parser.add_argument("--dump-hbm-path", type=str, default="",
+                    help="Directory for raw per-NPU HBM correctness dumps")
+parser.add_argument("--allreduce-input-seed", type=int, default=1,
+                    help="Deterministic seed for correctness input initialization")
 args = parser.parse_args()
+
+if args.dump_hbm_path:
+    os.makedirs(args.dump_hbm_path, exist_ok=True)
 
 requires(
     isa_required=ISA.X86,
@@ -145,6 +153,8 @@ board = X86BoardCXLType2(
     compute_lat_per_line=args.compute_lat,
     prefetch_ownership=args.prefetch_ownership,
     barrier_latency=args.barrier_lat,
+    dump_hbm_path=args.dump_hbm_path,
+    allreduce_input_seed=args.allreduce_input_seed,
 )
 
 command = (
@@ -177,5 +187,6 @@ print(f"[AllReduce] mode={args.lsu_mode}, lsu_num={args.lsu_num}, "
       f"num_l2_banks={args.num_l2_banks}, "
       f"cxl_link_latency={args.cxl_link_latency}, "
       f"cxl_link_bandwidth={args.cxl_link_bandwidth}GB/s, "
-      f"cxl_bw_factor={cxl_link_bandwidth_factor}, cxl_dram=HBM2")
+      f"cxl_bw_factor={cxl_link_bandwidth_factor}, "
+      f"allreduce_input_seed={args.allreduce_input_seed}, cxl_dram=HBM2")
 simulator.run()

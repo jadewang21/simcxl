@@ -2,6 +2,7 @@
 #define __DEV_X86_CXL_TYPE2_ACCEL_HH__
 
 #include <deque>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -254,6 +255,9 @@ class CXLType2Accel : public PciDevice
 
         // Barrier latency model
         Tick barrierLatency;
+        std::string dumpHbmPath;
+        uint64_t allreduceInputSeed;
+        bool allreduceInputInitialized;
 
         // Multi-NPU coordination
         static const int MAX_NPUS = 16;
@@ -265,6 +269,11 @@ class CXLType2Accel : public PciDevice
         bool tree17IsActive(int phase_type, int subround) const;
         void arBarrierReached();
         void arDoTransition();
+        bool readHbmLineFunctional(Addr addr, uint8_t *buf);
+        void writeHbmLineFunctional(Addr addr, const uint8_t *buf);
+        void fillAllReduceInputLine(uint8_t *buf, int line) const;
+        void initAllReduceInputIfNeeded();
+        void dumpHbmIfRequested();
         EventFunctionWrapper barrierReleaseEvent;
 
     protected:
